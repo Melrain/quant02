@@ -9,6 +9,8 @@ export type TradeEvent = {
   taker: 0 | 1; // 0-非吃单，1-吃单
   tradeId?: string; // OKX trades 提供的成交ID
   seq?: number; // okx独有，逐仓合约的成交序号
+  ingestId?: string; // 数据源标识，便于追溯
+  recvTs?: number; // 数据接收时间，便于追溯
 };
 
 // 盘口快照/增量
@@ -29,6 +31,8 @@ export type OrderBookEvent = {
   action?: 'partial' | 'update';
   u?: number; // last update id（l2-tbt）
   pu?: number; // prev update id（l2-tbt）
+  ingestId?: string; // 数据源标识，便于追溯
+  recvTs?: number; // 数据接收时间，便于追溯
 };
 
 // K线封装
@@ -44,6 +48,8 @@ export type KlineEvent = {
   close: string;
   vol: string; // 成交量（按 OKX 定义）
   confirm?: 0 | 1; // OKX candle 的第9列，1=已收盘，0=进行中
+  ingestId?: string; // 数据源标识，便于追溯
+  recvTs?: number; // 数据接收时间，便于追溯
 };
 
 // 持仓兴趣(OpenInterestEvent)
@@ -54,6 +60,8 @@ export type OpenInterestEvent = {
   ts: number; // 毫秒
   oi: string; //合约张数或币量
   oiCcy?: string;
+  ingestId?: string; // 数据源标识，便于追溯
+  recvTs?: number; // 数据接收时间，便于追溯
 };
 
 //资金费/基差
@@ -64,6 +72,8 @@ export type FundingRateEvent = {
   ts: number;
   rate: string;
   nextFundingTime?: number;
+  ingestId?: string; // 数据源标识，便于追溯
+  recvTs?: number; // 数据接收时间，便于追溯
 };
 
 export type BasisEvent = {
@@ -122,4 +132,6 @@ export type TickerEvent = {
   low24h?: string;
   vol24h?: string; // base 成交量
   volCcy24h?: string; // quote 成交量
+  ingestId?: string; // 数据源标识，便于追溯
+  recvTs?: number; // 数据接收时间，便于追溯
 };
