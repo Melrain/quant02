@@ -1,17 +1,12 @@
 import {
   Injectable,
   Logger,
-  OnModuleInit,
   OnModuleDestroy,
+  OnModuleInit,
 } from '@nestjs/common';
-
 import { newWin1m, applyTrade, vwapOf, type Win1m } from './window.state';
-import {
-  detAggressiveFlow,
-  detDeltaStrength,
-  detBreakout,
-  type IntraSignal,
-} from './detectors/intra-detectors';
+import type { DetectorCtx } from './detectors/intra-detectors';
+import { IntraAggregator } from './detectors/IntraAggregator';
 import { confOf } from './symbol.config';
 import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
 
@@ -56,7 +51,6 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     return Array.from(new Set(list));
   }
 
-  // 订阅标的（来自配置）
   // 订阅标的（来自环境变量；缺少专用配置时用默认 DEFAULT_SYM_CONF）
   private readonly symbols = this.parseSymbolsFromEnv();
 
@@ -80,7 +74,7 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     }
   >(); // 近3秒滑窗（名义额）
   private ewmaAbsDelta3s = new Map<string, Ewma>(); // 动态阈值参考
-  private lastSignalAt = new Map<string, { buy?: number; sell?: number }>(); // 冷却
+  private aggs = new Map<string, IntraAggregator>(); // 每个标的一个聚合器（冷却/去重/共识）
 
   constructor(private readonly stream: RedisStreamsService) {}
 
@@ -98,14 +92,25 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
         if (!this.flow3s.has(s))
           this.flow3s.set(s, { buy: 0, sell: 0, buf: [] });
         this.ewmaAbsDelta3s.set(s, new Ewma(0.01));
-        this.lastSignalAt.set(s, {});
+
+        // 聚合器初始化（参数可按品种配置）
+        const conf = confOf(s);
+        this.aggs.set(
+          s,
+          new IntraAggregator({
+            cooldownMs: conf.cooldownMs,
+            dedupMs: 1000,
+            minStrength: 0.55,
+            consensusBoost: 0.1,
+          }),
+        );
       }
 
       this.running = true;
       void this.loop();
       this.logger.log(`WindowWorker started for ${this.symbols.join(', ')}`);
     } catch (e) {
-      this.logger.error('onModuleInit failed', e);
+      this.logger.error('onModuleInit failed', e as Error);
       this.running = false;
     }
   }
@@ -120,7 +125,6 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
 
   private async loop() {
     const consumer = `window#${process.pid}`;
-
     while (this.running) {
       try {
         const keys = this.symbols.map((s) => this.stream.buildKey(s, 'trades'));
@@ -161,7 +165,7 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
             const w = this.win.get(m.symbol)!;
             applyTrade(w, t.px, t.qty, t.side);
 
-            // 3) 刷新进行中窗口 Hash（关键）
+            // 3) 刷新进行中窗口 Hash
             await this.writeWinState1m(m.symbol, w, t.ts);
 
             // 4) 维护滑窗/近价
@@ -179,7 +183,7 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
               .get(m.symbol)!
               .push(Math.abs(flow.buy - flow.sell));
 
-            // 6) 检测并写信号（带冷却）
+            // 6) 检测并写信号（聚合器内含冷却/去重）
             await this.detectAndEmit(m.symbol, w, t.ts);
 
             // 7) ACK
@@ -195,7 +199,7 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
         for (const [key, ids] of ackMap)
           if (ids.length) await this.stream.ack(key, 'cg:window', ids);
       } catch (e) {
-        this.logger.error('loop iteration error', e);
+        this.logger.error('loop iteration error', e as Error);
       }
     }
   }
@@ -240,7 +244,7 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     const arr = this.lastPrices.get(sym)!;
     const dyn = this.ewmaAbsDelta3s.get(sym)!.value();
 
-    const ctx = {
+    const ctx: DetectorCtx = {
       now: ts,
       sym,
       win: w,
@@ -253,17 +257,16 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
       dynDeltaK: conf.dynDeltaK,
     };
 
-    let best: IntraSignal | null = null;
-    for (const det of [detAggressiveFlow, detDeltaStrength, detBreakout]) {
-      const s = det(ctx as any);
-      if (s && (!best || Number(s.strength) > Number(best.strength))) best = s;
-    }
+    const agg = this.aggs.get(sym)!;
+    const best = agg.detect(ctx);
     if (!best) return;
 
-    // 冷却（同方向）
-    const last = this.lastSignalAt.get(sym)!;
-    const lastTs = best.dir === 'buy' ? (last.buy ?? 0) : (last.sell ?? 0);
-    if (ts - lastTs < conf.cooldownMs) return;
+    const sum3s = f.buy + f.sell;
+    this.logger.log(
+      `[signal] inst=${sym} dir=${best.dir} strength=${best.strength} src=${best.evidence.src ?? ''} notional3s=${sum3s.toFixed(0)} ` +
+        `delta3s=${best.evidence.delta3s ?? ''} zLike=${best.evidence.zLike ?? ''} ` +
+        `buyShare3s=${best.evidence.buyShare3s ?? ''} breakout=${best.evidence.breakout ?? ''}`,
+    );
 
     const signalKey = this.stream.buildOutKey(sym, 'signal:detected');
     await this.stream.xadd(
@@ -274,7 +277,9 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
         instId: sym,
         dir: best.dir,
         strength: best.strength,
+        'evidence.src': best.evidence.src ?? '',
         'evidence.delta3s': best.evidence.delta3s ?? '',
+        'evidence.zLike': best.evidence.zLike ?? '',
         'evidence.buyShare3s': best.evidence.buyShare3s ?? '',
         'evidence.notional3s': best.evidence.notional3s ?? '',
         'evidence.breakout': best.evidence.breakout ?? '',
@@ -285,9 +290,6 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
       },
       { maxlenApprox: 5_000 },
     );
-
-    if (best.dir === 'buy') last.buy = ts;
-    else last.sell = ts;
   }
 
   /** 进行中 1m 窗口 Hash（win:state:1m:{sym}） */
@@ -349,24 +351,45 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     tfMs: number,
     store: Map<string, Win1m>,
   ) {
-    const tfClose = this.getTfCloseFrom1mClose(m1.closeTs, tfMs);
+    const tfClose = Math.floor((m1.closeTs - 1) / tfMs) * tfMs + tfMs;
     let w = store.get(sym);
 
     // 新 TF 边界：封旧 TF
     if (w && w.closeTs !== tfClose) {
       const gap = tfClose - w.closeTs > tfMs;
       await this.sealTf(sym, w, tfName, gap);
-      w = undefined;
+      w = undefined as any;
     }
 
     // 无 TF 窗口：创建
     if (!w) {
-      w = this.newWinSpan(tfClose, m1.open, tfMs);
+      w = {
+        startTs: tfClose - tfMs,
+        closeTs: tfClose,
+        open: m1.open,
+        high: m1.open,
+        low: m1.open,
+        last: m1.open,
+        vol: 0,
+        vbuy: 0,
+        vsell: 0,
+        vwapNum: 0,
+        vwapDen: 0,
+        tickN: 0,
+      };
       store.set(sym, w);
     }
 
     // 累积 1m → TF
-    this.applyBarToWin(w, m1);
+    w.last = m1.last;
+    if (Number(m1.high) > Number(w.high)) w.high = m1.high;
+    if (Number(m1.low) < Number(w.low)) w.low = m1.low;
+    w.vol += m1.vol;
+    w.vbuy += m1.vbuy;
+    w.vsell += m1.vsell;
+    w.tickN += m1.tickN;
+    w.vwapNum += m1.vwapNum;
+    w.vwapDen += m1.vwapDen;
 
     // 刷新进行中 TF Hash
     await this.writeWinStateTf(sym, w, tfName, Date.now());
@@ -422,41 +445,5 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
       tickN: String(w.tickN),
     });
     await this.stream.expire(key, 10 * 60);
-  }
-
-  private getTfCloseFrom1mClose(closeTs1m: number, tfMs: number) {
-    // 把 1m close 对齐到上位 TF 的 close（上取整到 tf 边界）
-    return Math.floor((closeTs1m - 1) / tfMs) * tfMs + tfMs;
-  }
-
-  private newWinSpan(closeTs: number, firstPx: string, spanMs: number): Win1m {
-    return {
-      startTs: closeTs - spanMs,
-      closeTs,
-      open: firstPx,
-      high: firstPx,
-      low: firstPx,
-      last: firstPx,
-      vol: 0,
-      vbuy: 0,
-      vsell: 0,
-      vwapNum: 0,
-      vwapDen: 0,
-      tickN: 0,
-    };
-  }
-
-  private applyBarToWin(dst: Win1m, srcBar: Win1m) {
-    dst.last = srcBar.last;
-    if (Number(srcBar.high) > Number(dst.high)) dst.high = srcBar.high;
-    if (Number(srcBar.low) < Number(dst.low)) dst.low = srcBar.low;
-
-    dst.vol += srcBar.vol;
-    dst.vbuy += srcBar.vbuy;
-    dst.vsell += srcBar.vsell;
-    dst.tickN += srcBar.tickN;
-
-    dst.vwapNum += srcBar.vwapNum;
-    dst.vwapDen += srcBar.vwapDen;
   }
 }
