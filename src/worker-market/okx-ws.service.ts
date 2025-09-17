@@ -33,7 +33,7 @@ export class OkxWsService implements OnModuleInit, OnModuleDestroy {
       this.logger.log(`Unsubscribed ${JSON.stringify(arg)}`),
     );
 
-    await this.bootstrapSymbols(['BTC-USDT', 'ETH-USDT']);
+    await this.bootstrapSymbols(['BTC-USDT-SWAP', 'ETH-USDT-SWAP']);
 
     await this.client.connect();
   }
@@ -68,8 +68,8 @@ export class OkxWsService implements OnModuleInit, OnModuleDestroy {
   subscribeOrderBook(instId: string, depth?: BookDepth) {
     return this.client.subscribeOrderBook(instId, depth);
   }
-  subscribeOpenInterest(instType: 'SWAP' | 'FUTURES' | 'OPTION', uly: string) {
-    return this.client.subscribeOpenInterest(instType, uly);
+  subscribeOpenInterest(instId: string) {
+    return this.client.subscribeOpenInterest(instId);
   }
   subscribeFundingRate(instId: string) {
     return this.client.subscribeFundingRate(instId);
@@ -87,14 +87,20 @@ export class OkxWsService implements OnModuleInit, OnModuleDestroy {
   ) {
     const want = {
       trades: true,
-      tickers: false,
+      tickers: true,
       bookDepth: 'books5' as BookDepth,
       candles: [] as CandleBar[],
+      oi: true,
+      funding: true,
+
       ...(opts ?? {}),
     };
     for (const s of instIds) {
       if (want.trades) await this.client.subscribeTrades(s);
       if (want.tickers) await this.client.subscribeTickers(s);
+      if (want.oi) await this.client.subscribeOpenInterest(s);
+      if (want.funding) await this.client.subscribeFundingRate(s);
+
       if (want.bookDepth)
         await this.client.subscribeOrderBook(s, want.bookDepth);
       for (const b of want.candles) await this.client.subscribeCandles(s, b);

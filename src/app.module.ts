@@ -3,6 +3,8 @@ import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { EventEmitterModule } from '@nestjs/event-emitter';
 import { WorkMarketModule } from './worker-market/work-market.module';
+import { RedisModule } from './redis/redis.module';
+import { RedisStreamsModule } from './redis-streams/redis-streams.module';
 
 @Module({
   imports: [
@@ -12,6 +14,8 @@ import { WorkMarketModule } from './worker-market/work-market.module';
       maxListeners: 100,
     }),
     WorkMarketModule,
+    RedisModule,
+    RedisStreamsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

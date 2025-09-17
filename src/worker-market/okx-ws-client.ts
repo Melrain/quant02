@@ -299,11 +299,10 @@ export class OkxWsClient {
   ) {
     return this.subscribe({ channel: depth, instId, priority: 1 }); // 订单簿 - 高优先级
   }
-  subscribeOpenInterest(instType: 'SWAP' | 'FUTURES' | 'OPTION', uly: string) {
+  subscribeOpenInterest(instId: string) {
     return this.subscribe({
       channel: 'open-interest',
-      instType,
-      uly,
+      instId,
       priority: 2,
     });
   }
