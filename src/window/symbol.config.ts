@@ -1,82 +1,108 @@
 // 每个 instId（如 BTC-USDT-SWAP）的一些口径与阈值
 export type SymbolConfig = {
-  // 名义额换算：如果 qty 是“张”，需要 contractMultiplier * px → USD 名义额
-  // 如果 qty 已经是币，则 notional = px * qty
   contractMultiplier?: number; // e.g. 合约乘数（张→币 or 直接张→USD）
   minNotional3s?: number; // flow/delta 检测的最小近3秒总名义额
   cooldownMs?: number; // 同方向信号冷却
   breakoutBandPct?: number; // 突破最小确认阈值（band 的百分比）
   dynDeltaK?: number; // 动态阈值放大系数
+
+  // 聚合器可按品种覆盖（可选）
+  dedupMs?: number; // 去重窗口
+  minStrength?: number; // 最小强度门槛
+  consensusBoost?: number; // 共识加权
 };
 
 // 缺省值（未配置的 instId 用这套）
 export const DEFAULT_SYM_CONF: Required<SymbolConfig> = {
-  contractMultiplier: 1, // 默认 qty * px 即 USD 名义额
-  minNotional3s: 2_000, // 低于此不触发 flow/delta 类信号
-  cooldownMs: 3000, // 3s 冷却
-  breakoutBandPct: 0.02, // 2% band 确认
-  dynDeltaK: 1.0, // 动态阈值系数
+  contractMultiplier: 1,
+  minNotional3s: 2_000,
+  cooldownMs: 6000, // 默认为 6s（更稳健）
+  breakoutBandPct: 0.02,
+  dynDeltaK: 1.2, // 略高，提升显著性门槛
+
+  dedupMs: 3000,
+  minStrength: 0.65,
+  consensusBoost: 0.1,
 };
 
-// 这里填你的关注列表与特化参数
+// 分层示例：请按历史数据再微调
 export const SYMBOLS: Record<string, SymbolConfig> = {
+  // 大盘
   'BTC-USDT-SWAP': {
     contractMultiplier: 1,
-    minNotional3s: 10_000,
-    cooldownMs: 3000,
-    breakoutBandPct: 0.01,
-    dynDeltaK: 1.0,
+    minNotional3s: 3_000_000,
+    cooldownMs: 9000,
+    dedupMs: 4000,
+    minStrength: 0.7,
+    breakoutBandPct: 0.012,
+    dynDeltaK: 1.8,
   },
   'ETH-USDT-SWAP': {
     contractMultiplier: 1,
-    minNotional3s: 5_000,
-    cooldownMs: 3000,
+    minNotional3s: 1_200_000,
+    cooldownMs: 8000,
+    dedupMs: 4000,
+    minStrength: 0.68,
     breakoutBandPct: 0.015,
-    dynDeltaK: 1.0,
+    dynDeltaK: 1.6,
   },
-  // 新增：按流动性与噪声设置起步值（后续回放再调）
-  'DOGE-USDT-SWAP': {
-    contractMultiplier: 1, // 若交易所 qty=张，请改成每张对应的币量乘数
-    minNotional3s: 1_500,
-    cooldownMs: 3000,
-    breakoutBandPct: 0.025, // 噪声高，放大确认
-    dynDeltaK: 1.1,
-  },
+
+  // 中盘
   'LTC-USDT-SWAP': {
     contractMultiplier: 1,
-    minNotional3s: 3_000,
-    cooldownMs: 3000,
+    minNotional3s: 150_000,
+    cooldownMs: 7000,
+    dedupMs: 3500,
+    minStrength: 0.68,
     breakoutBandPct: 0.018,
-    dynDeltaK: 1.0,
+    dynDeltaK: 1.4,
   },
+  'DOGE-USDT-SWAP': {
+    contractMultiplier: 1,
+    minNotional3s: 80_000,
+    cooldownMs: 7000,
+    dedupMs: 3500,
+    minStrength: 0.68,
+    breakoutBandPct: 0.025,
+    dynDeltaK: 1.5,
+  },
+
+  // 噪声高/小盘
   'SHIB-USDT-SWAP': {
     contractMultiplier: 1,
-    minNotional3s: 1_000,
-    cooldownMs: 3000,
+    minNotional3s: 50_000,
+    cooldownMs: 9000,
+    dedupMs: 4000,
+    minStrength: 0.7,
     breakoutBandPct: 0.03,
-    dynDeltaK: 1.15,
+    dynDeltaK: 1.7,
   },
-  // 下列为小盘/新币，阈值更宽松且确认更严格（建议先回放调参）
   'PUMP-USDT-SWAP': {
     contractMultiplier: 1,
-    minNotional3s: 500,
-    cooldownMs: 3000,
+    minNotional3s: 20_000,
+    cooldownMs: 12_000,
+    dedupMs: 5000,
+    minStrength: 0.7,
     breakoutBandPct: 0.05,
-    dynDeltaK: 1.2,
+    dynDeltaK: 1.8,
   },
   'WLFI-USDT-SWAP': {
     contractMultiplier: 1,
-    minNotional3s: 500,
-    cooldownMs: 3000,
+    minNotional3s: 20_000,
+    cooldownMs: 12_000,
+    dedupMs: 5000,
+    minStrength: 0.7,
     breakoutBandPct: 0.05,
-    dynDeltaK: 1.2,
+    dynDeltaK: 1.8,
   },
   'XPL-USDT-SWAP': {
     contractMultiplier: 1,
-    minNotional3s: 500,
-    cooldownMs: 3000,
+    minNotional3s: 20_000,
+    cooldownMs: 12_000,
+    dedupMs: 5000,
+    minStrength: 0.7,
     breakoutBandPct: 0.05,
-    dynDeltaK: 1.2,
+    dynDeltaK: 1.8,
   },
 };
 

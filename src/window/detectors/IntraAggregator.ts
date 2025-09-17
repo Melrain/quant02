@@ -13,9 +13,9 @@ export type AggregatorConfig = {
 };
 
 const DEFAULT_CFG: AggregatorConfig = {
-  minStrength: 0.55,
-  cooldownMs: 3000,
-  dedupMs: 1000,
+  minStrength: 0.65,
+  cooldownMs: 6000,
+  dedupMs: 3000,
   consensusBoost: 0.1,
 };
 

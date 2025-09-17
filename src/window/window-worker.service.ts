@@ -99,9 +99,9 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
           s,
           new IntraAggregator({
             cooldownMs: conf.cooldownMs,
-            dedupMs: 1000,
-            minStrength: 0.55,
-            consensusBoost: 0.1,
+            dedupMs: conf.dedupMs, // 按品种去重
+            minStrength: conf.minStrength, // 按品种强度门槛
+            consensusBoost: conf.consensusBoost, // 按品种共识加权
           }),
         );
       }
