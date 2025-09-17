@@ -6,7 +6,10 @@ export type StreamKind =
   | 'oi'
   | 'funding'
   | 'ticker'
-  | 'custom';
+  | 'custom'
+  | 'signal:detected' // 预留
+  | 'win:state:1m'
+  | 'win:1m'; // 预留：1分钟窗口数据
 
 /** 写入选项 */
 export type StreamWriteOptions = {

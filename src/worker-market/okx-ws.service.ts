@@ -14,6 +14,31 @@ type BookDepth = Parameters<OkxWsClient['subscribeOrderBook']>[1];
 export class OkxWsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OkxWsService.name);
 
+  // 将短写 token 映射为 OKX instId；若已是完整 instId 则原样（转大写）
+  private toInstId(token: string): string {
+    const t = token.trim();
+    if (!t) return '';
+    const u = t.toUpperCase();
+    // 已经是完整 instId（包含连字符），例如 BTC-USDT-SWAP
+    if (u.includes('-')) return u;
+    // 短写 -> 统一映射到 USDT 永续
+    return `${u}-USDT-SWAP`;
+  }
+
+  // 解析环境变量：支持短写（btc,eth,...）或完整（BTC-USDT-SWAP,ETH-USDT-SWAP,...）
+  private parseSymbolsFromEnv(): string[] {
+    // 优先 OKX_ASSETS（短写），否则用 OKX_SYMBOLS（可短写或全称）
+    const raw =
+      process.env.OKX_ASSETS ??
+      process.env.OKX_SYMBOLS ??
+      'btc,eth,doge,ltc,shib,pump,wlfi,xpl'; // 默认短写
+    const list = raw
+      .split(',')
+      .map((s) => this.toInstId(s))
+      .filter(Boolean);
+    return Array.from(new Set(list)); // 去重
+  }
+
   constructor(
     private readonly client: OkxWsClient,
     private readonly bus: EventEmitter2,
@@ -33,9 +58,12 @@ export class OkxWsService implements OnModuleInit, OnModuleDestroy {
       this.logger.log(`Unsubscribed ${JSON.stringify(arg)}`),
     );
 
-    await this.bootstrapSymbols(['BTC-USDT-SWAP', 'ETH-USDT-SWAP']);
+    // 使用短写/混合环境变量
+    const instIds = this.parseSymbolsFromEnv();
+    this.logger.log(`Bootstrapping OKX symbols: ${instIds.join(', ')}`);
 
     await this.client.connect();
+    await this.bootstrapSymbols(instIds);
   }
 
   async onModuleDestroy() {

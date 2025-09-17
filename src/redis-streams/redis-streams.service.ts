@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unsafe-return */
 // src/infra/redis/redis-stream.service.ts
 import { Injectable, Logger } from '@nestjs/common';
 import { RedisClient } from '../redis/redis.client';
@@ -38,7 +39,12 @@ export class RedisStreamsService
 
   /** 业务 Stream Key（带哈希标签 + 统一前缀） */
   buildKey(symbol: string, kind: StreamKind) {
-    return this.redis.key(`ws:{${symbol}}:${kind}`);
+    // 使用业务 key，底层 RedisClient 会统一加环境前缀
+    return `ws:{${symbol}}:${kind}`;
+  }
+  /** 输出类业务 Key：如 win:1m:{sym} / signal:detected:{sym} / win:state:1m:{sym} */
+  buildOutKey(symbol: string, base: string) {
+    return `${base}:{${symbol}}`;
   }
 
   /** kline key：ws:{symbol}:kline1m / kline5m ... */
@@ -455,5 +461,15 @@ export class RedisStreamsService
       if (acc.length) out.push({ key: k, entries: acc });
     }
     return out;
+  }
+
+  /** Hash:  代理（自动前缀由 RedisClient 处理） */
+  async hset(key: string, obj: Record<string, string | number>) {
+    return this.redis.hset(key, obj);
+  }
+
+  /** Key 过期（秒）代理 */
+  async expire(key: string, seconds: number) {
+    return this.redis.expire(key, seconds);
   }
 }
