@@ -4,7 +4,27 @@ import { confOf } from '../window/symbol.config';
 import Redis from 'ioredis';
 
 // 你可以改成从 args 或 env 读取
-const SYMS = (process.env.SYMBOLS || 'BTC-USDT-SWAP,ETH-USDT-SWAP').split(',');
+function toInstId(token: string): string {
+  const t = token.trim();
+  if (!t) return '';
+  const u = t.toUpperCase();
+  return u.includes('-') ? u : `${u}-USDT-SWAP`;
+}
+
+function parseSymbolsFromEnv(): string[] {
+  const raw =
+    process.env.SYMBOLS ?? // 显式列表优先
+    process.env.OKX_ASSETS ?? // 短写，如 btc,eth,doge
+    process.env.OKX_SYMBOLS ?? // 可混用
+    'btc,eth';
+  const list = raw
+    .split(',')
+    .map((s) => toInstId(s))
+    .filter(Boolean);
+  return Array.from(new Set(list));
+}
+
+const SYMS = parseSymbolsFromEnv();
 
 function toHash(conf: ReturnType<typeof confOf>) {
   return {
@@ -23,10 +43,10 @@ function toHash(conf: ReturnType<typeof confOf>) {
 }
 
 async function main() {
-  const redis = new Redis(process.env.REDIS_URL || 'redis://127.0.0.1:6379');
-
+  const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+  console.log(`[seed] redis=${redisUrl} symbols=${SYMS.join(',')}`);
+  const redis = new Redis(redisUrl);
   await redis.connect?.();
-
   for (const sym of SYMS) {
     const conf = confOf(sym);
     const key = `qt:param:effective:${sym}`;
@@ -34,7 +54,6 @@ async function main() {
     await redis.hset(key, hash as any);
     console.log(`[seed] ${sym} -> ${key}`, hash);
   }
-
   await redis.quit?.();
 }
 

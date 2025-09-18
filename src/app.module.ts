@@ -7,9 +7,11 @@ import { RedisModule } from './redis/redis.module';
 import { RedisStreamsModule } from './redis-streams/redis-streams.module';
 import { WindowModule } from './window/window.module';
 import { ParamModule } from './params/params.module';
+import { ConfigModule } from '@nestjs/config';
 
 @Module({
   imports: [
+    ConfigModule.forRoot({ isGlobal: true, envFilePath: '.env' }),
     EventEmitterModule.forRoot({
       wildcard: true,
       delimiter: '.',

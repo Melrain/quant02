@@ -80,6 +80,9 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
   private ewmaAbsDelta3s = new Map<string, Ewma>(); // 动态阈值参考
   private aggs = new Map<string, IntraAggregator>(); // 每个标的一个聚合器（冷却/去重/共识）
 
+  // 参数快照：仅当变化时打印
+  private lastEffSnapshot = new Map<string, string>(); // sym -> JSON
+
   constructor(
     private readonly stream: RedisStreamsService,
     private readonly eventEmitter: EventEmitter2,
@@ -103,6 +106,14 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
 
         // 使用动态参数初始化聚合器
         const eff = await this.params.getEffective(s);
+        this.logger.log(
+          `[param.effective:init] ${s} ` +
+            `src=${eff.source} cm=${eff.contractMultiplier} ` +
+            `minNotional3s=${eff.minNotional3s} ` +
+            `cooldown=${eff.cooldownMs} dedup=${eff.dedupMs} ` +
+            `minStrength=${eff.minStrength} cb=${eff.consensusBoost} ` +
+            `band=${eff.breakoutBandPct} K=${eff.dynDeltaK} liqK=${eff.liqK}`,
+        );
         this.aggs.set(
           s,
           new IntraAggregator({
@@ -110,6 +121,23 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
             dedupMs: eff.dedupMs,
             minStrength: eff.minStrength,
             consensusBoost: eff.consensusBoost,
+          }),
+        );
+
+        // 记录首个快照（避免启动后第一条 trade 又打印一次 change）
+        this.lastEffSnapshot.set(
+          s,
+          JSON.stringify({
+            src: eff.source,
+            cm: eff.contractMultiplier,
+            minN: eff.minNotional3s,
+            cd: eff.cooldownMs,
+            dd: eff.dedupMs,
+            ms: eff.minStrength,
+            cb: eff.consensusBoost,
+            band: eff.breakoutBandPct,
+            K: eff.dynDeltaK,
+            lq: eff.liqK,
           }),
         );
       }
@@ -156,6 +184,27 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
 
             // 读取该符号的动态参数（带 1s 本地缓存）
             const eff = await this.params.getEffective(m.symbol);
+
+            // 打印“参数变化”日志（不刷屏）
+            const snapNow = JSON.stringify({
+              src: eff.source,
+              cm: eff.contractMultiplier,
+              minN: eff.minNotional3s,
+              cd: eff.cooldownMs,
+              dd: eff.dedupMs,
+              ms: eff.minStrength,
+              cb: eff.consensusBoost,
+              band: eff.breakoutBandPct,
+              K: eff.dynDeltaK,
+              lq: eff.liqK,
+            });
+            const snapPrev = this.lastEffSnapshot.get(m.symbol);
+            if (snapPrev !== snapNow) {
+              this.lastEffSnapshot.set(m.symbol, snapNow);
+              this.logger.log(
+                `[param.effective:change] ${m.symbol} ${snapNow}`,
+              );
+            }
 
             // 1) 切桶
             const closeTs = this.getCloseTs(t.ts);
@@ -277,10 +326,18 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     if (!best) return;
 
     const sum3s = f.buy + f.sell;
+    const paramStr =
+      `cm=${eff.contractMultiplier} minNotional3s=${eff.minNotional3s} ` +
+      `band=${eff.breakoutBandPct} dynK=${eff.dynDeltaK} liqK=${eff.liqK} ` +
+      `minStrength=${eff.minStrength} cb=${eff.consensusBoost} ` +
+      `cooldown=${eff.cooldownMs} dedup=${eff.dedupMs} dynAbsDelta=${dyn.toFixed(0)}`;
+
     this.logger.log(
-      `[signal] inst=${sym} dir=${best.dir} strength=${best.strength} src=${best.evidence.src ?? ''} notional3s=${sum3s.toFixed(0)} ` +
+      `[signal] inst=${sym} dir=${best.dir} strength=${best.strength} src=${best.evidence.src ?? ''} ` +
+        `notional3s=${sum3s.toFixed(0)} (buy=${f.buy.toFixed(0)} sell=${f.sell.toFixed(0)} min=${eff.minNotional3s}) ` +
         `delta3s=${best.evidence.delta3s ?? ''} zLike=${best.evidence.zLike ?? ''} ` +
-        `buyShare3s=${best.evidence.buyShare3s ?? ''} breakout=${best.evidence.breakout ?? ''}`,
+        `buyShare3s=${best.evidence.buyShare3s ?? ''} breakout=${best.evidence.breakout ?? ''} ` +
+        `| params: ${paramStr}`,
     );
 
     const signalKey = this.stream.buildOutKey(sym, 'signal:detected');

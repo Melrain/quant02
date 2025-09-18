@@ -23,14 +23,26 @@ export class ParamRefresher implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(ParamRefresher.name);
   private running = false;
 
-  /** 你已在 window-worker 里解析过 ENV；这里也可直接复用同一方法 */
-  private parseSymbolsFromEnv(): string[] {
-    const raw = process.env.SYMBOLS || 'BTC-USDT-SWAP,ETH-USDT-SWAP';
-    return raw
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
+  // 短写 -> instId 映射，兼容已是完整 instId 的情况
+  private toInstId(token: string): string {
+    const t = token.trim();
+    if (!t) return '';
+    const u = t.toUpperCase();
+    return u.includes('-') ? u : `${u}-USDT-SWAP`;
   }
+  // 与 okx-ws.service.ts 一致：优先 OKX_ASSETS（短写），否则 OKX_SYMBOLS（可混用）
+  private parseSymbolsFromEnv(): string[] {
+    const raw =
+      process.env.OKX_ASSETS ??
+      process.env.OKX_SYMBOLS ??
+      'btc,eth,doge,ltc,shib,pump,wlfi,xpl';
+    const list = raw
+      .split(',')
+      .map((s) => this.toInstId(s))
+      .filter(Boolean);
+    return Array.from(new Set(list));
+  }
+
   private readonly symbols = this.parseSymbolsFromEnv();
 
   // 刷新节奏（你可按需调整）
