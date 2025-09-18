@@ -6,7 +6,7 @@ import { WorkMarketModule } from './worker-market/work-market.module';
 import { RedisModule } from './redis/redis.module';
 import { RedisStreamsModule } from './redis-streams/redis-streams.module';
 import { WindowModule } from './window/window.module';
-import { ParamModule } from './params/params.module';
+
 import { ConfigModule } from '@nestjs/config';
 
 @Module({
@@ -21,7 +21,6 @@ import { ConfigModule } from '@nestjs/config';
     RedisModule,
     RedisStreamsModule,
     WindowModule,
-    ParamModule,
   ],
   controllers: [AppController],
   providers: [AppService],

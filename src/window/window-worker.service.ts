@@ -1,3 +1,28 @@
+// window-worker.service.ts
+// 负责：
+//  - 读 trades 流，按 1m 切桶并写 win:1m 流
+//  - 滑窗统计近3s 名义额流入（买/卖）
+//  - 缓存近价（用于简单趋势/统计）
+//  - 检测信号（基于近3s 流入 + 近价行为）
+//  - 写信号流 win:signal:detected
+//  - 写进行中窗口 Hash（win:state:1m/{sym}，以及 5m/15m）
+//  - 向上滚动 5m/15m 窗口（win:5m/15m + win:state:5m/15m/{sym}）
+//
+// 基于 Redis Streams + Hash 实现，单进程单消费者
+//
+// 参数：
+//  - 标的列表：环境变量 OKX_ASSETS（短写，优先）或 OKX_SYMBOLS（可混用）
+//  - 窗口参数：常量
+//  - 信号检测参数：来自 symbol.config.ts（可按标的覆盖）
+//
+// 注意：
+//  - 本模块不直接与交易所交互，依赖 Redis Streams 作为数据总线
+//  - 本模块不直接与交易模块交互，信号通过 Redis Stream 输出，供其他模块订阅
+//  - 本模块不负责持久化任何运行态，所有中间态均存于 Redis（可重启恢复）
+//  - 本模块假设单进程单消费者运行（无分片），否则会有重复信号
+//  - 本模块假设系统时钟单调递增，否则可能出现异常
+//  - 本模块假设 Redis 可用且性能良好，否则会阻塞
+
 import {
   Injectable,
   Logger,
@@ -9,10 +34,10 @@ import type { DetectorCtx } from './detectors/intra-detectors';
 import { IntraAggregator } from './detectors/IntraAggregator';
 import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
 import { EventEmitter2 } from '@nestjs/event-emitter';
-import {
-  ParamRepository,
-  type EffectiveParams,
-} from 'src/params/param.repository';
+// 新增：从 symbol.config.ts 引入动态参数
+// 新增：从 symbol.config.ts 引入动态参数
+import { confOf, type SymbolConfig } from './symbol.config';
+type EffectiveParams = Required<SymbolConfig>;
 
 type Trade = { ts: number; px: string; qty: string; side?: 'buy' | 'sell' };
 
@@ -83,10 +108,19 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
   // 参数快照：仅当变化时打印
   private lastEffSnapshot = new Map<string, string>(); // sym -> JSON
 
+  // 新增：1s 本地缓存
+  private effCache = new Map<string, { ts: number; eff: EffectiveParams }>();
+  private getEff(sym: string, now: number): EffectiveParams {
+    const c = this.effCache.get(sym);
+    if (c && now - c.ts < 1000) return c.eff;
+    const eff = confOf(sym);
+    this.effCache.set(sym, { ts: now, eff });
+    return eff;
+  }
+
   constructor(
     private readonly stream: RedisStreamsService,
     private readonly eventEmitter: EventEmitter2,
-    private readonly params: ParamRepository,
   ) {}
 
   async onModuleInit() {
@@ -105,10 +139,10 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
         this.ewmaAbsDelta3s.set(s, new Ewma(0.01));
 
         // 使用动态参数初始化聚合器
-        const eff = await this.params.getEffective(s);
+        const eff = this.getEff(s, Date.now());
         this.logger.log(
           `[param.effective:init] ${s} ` +
-            `src=${eff.source} cm=${eff.contractMultiplier} ` +
+            `cm=${eff.contractMultiplier} ` +
             `minNotional3s=${eff.minNotional3s} ` +
             `cooldown=${eff.cooldownMs} dedup=${eff.dedupMs} ` +
             `minStrength=${eff.minStrength} cb=${eff.consensusBoost} ` +
@@ -128,7 +162,6 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
         this.lastEffSnapshot.set(
           s,
           JSON.stringify({
-            src: eff.source,
             cm: eff.contractMultiplier,
             minN: eff.minNotional3s,
             cd: eff.cooldownMs,
@@ -183,11 +216,9 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
             if (!t) continue;
 
             // 读取该符号的动态参数（带 1s 本地缓存）
-            const eff = await this.params.getEffective(m.symbol);
-
+            const eff = this.getEff(m.symbol, Date.now());
             // 打印“参数变化”日志（不刷屏）
             const snapNow = JSON.stringify({
-              src: eff.source,
               cm: eff.contractMultiplier,
               minN: eff.minNotional3s,
               cd: eff.cooldownMs,
