@@ -17,6 +17,8 @@ export type DetectorCtx = {
   // 动态阈值参考
   dynAbsDelta: number; // 近 1h |delta3s| 的 EWMA（或中位数）
   dynDeltaK: number; // 动态阈值系数
+
+  liqK: number; // 流动性系数
 };
 
 export type IntraSignal = {
@@ -34,7 +36,7 @@ export function detAggressiveFlow(ctx: DetectorCtx): IntraSignal | null {
   const sum = buy + sell;
 
   // 更稳健的最小流动性门槛：结合历史动态值
-  const liqTh = Math.max(ctx.minNotional3s, 0.5 * ctx.dynAbsDelta);
+  const liqTh = Math.max(ctx.minNotional3s, ctx.liqK * ctx.dynAbsDelta);
   if (!(sum > liqTh)) return null;
 
   const buyShare = sum > 0 ? buy / sum : 0.5;
@@ -81,7 +83,10 @@ export function detDeltaStrength(ctx: DetectorCtx): IntraSignal | null {
 
   // 最低流动性过滤，避免小额噪声触发
   const sum = ctx.buyNotional3s + ctx.sellNotional3s;
-  const liqTh = Math.max(ctx.minNotional3s * 0.5, 0.25 * ctx.dynAbsDelta);
+  const liqTh = Math.max(
+    0.5 * ctx.minNotional3s,
+    0.5 * ctx.liqK * ctx.dynAbsDelta,
+  );
   if (sum < liqTh) return null;
 
   // 动态阈值：max(最小值, dynAbsDelta * K)

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 // src/infra/redis/redis-stream.service.ts
 import { Injectable, Logger } from '@nestjs/common';
@@ -461,6 +462,69 @@ export class RedisStreamsService
       if (acc.length) out.push({ key: k, entries: acc });
     }
     return out;
+  }
+
+  // src/redis-streams/redis-streams.service.ts
+  async xrevrange(
+    key: string,
+    end: string = '+', // 保留参数签名，实际不使用
+    start: string = '-', // 保留参数签名，实际不使用
+    count: number = 600,
+  ): Promise<Array<[string, Record<string, string>]>> {
+    // 直接调用你已有的 XRANGE：从头到尾取最多 count 条
+    // 如果你的 xrange 签名不同（比如没有 count 参数），按你的实现调整
+    const rows = await this.xrange(key, '-', '+', count);
+    // 取尾部 count 条并倒序，模拟 XREVRANGE 语义（新→旧）
+    const tail = rows.slice(-Math.min(count, rows.length)).reverse();
+    return tail;
+  }
+
+  // src/redis-streams/redis-streams.service.ts
+
+  /**
+   * XRANGE 封装
+   * @param key   stream 键名
+   * @param start 起始 ID（通常用 '-' 表示最旧）
+   * @param end   结束 ID（通常用 '+' 表示最新）
+   * @param count 限制条数（可选）
+   * @returns     Array<[id, Record<string,string>]>
+   */
+  async xrange(
+    key: string,
+    start: string = '-',
+    end: string = '+',
+    count?: number,
+  ): Promise<Array<[string, Record<string, string>]>> {
+    const cli: any = (this as any).redis || (this as any).client;
+
+    const args: (string | number)[] = [key, start, end];
+    if (count) {
+      args.push('COUNT', count);
+    }
+
+    // ioredis 有 call / send_command，不同版本名字不同
+    let res: any;
+    if (typeof cli?.xrange === 'function') {
+      res = await cli.xrange(...args);
+    } else if (typeof cli?.call === 'function') {
+      res = await cli.call('XRANGE', ...args);
+    } else if (typeof cli?.send_command === 'function') {
+      res = await cli.send_command('XRANGE', args);
+    } else {
+      throw new Error('Redis client does not support XRANGE');
+    }
+
+    // 把 Redis 的 [id, [k1,v1,k2,v2,...]] 转成 [id, {k1:v1,...}]
+    return (res as any[]).map(([id, arr]) => [id, this.arrayToHash(arr)]);
+  }
+
+  /** 小工具：把 [k1,v1,k2,v2,...] 转成 {k1:v1,...} */
+  private arrayToHash(arr: string[]): Record<string, string> {
+    const h: Record<string, string> = {};
+    for (let i = 0; i < arr.length; i += 2) {
+      h[arr[i]] = arr[i + 1];
+    }
+    return h;
   }
 
   /** Hash:  代理（自动前缀由 RedisClient 处理） */

@@ -10,6 +10,7 @@ export type AggregatorConfig = {
   cooldownMs: number; // 同方向冷却
   dedupMs: number; // 去重窗口（同 sym/dir/证据近似）
   consensusBoost: number; // 共识加权
+  adaptMinByConsensus?: boolean; // 同向共识越多，过线门槛适度降低
 };
 
 const DEFAULT_CFG: AggregatorConfig = {
@@ -17,6 +18,7 @@ const DEFAULT_CFG: AggregatorConfig = {
   cooldownMs: 6000,
   dedupMs: 3000,
   consensusBoost: 0.1,
+  adaptMinByConsensus: true,
 };
 
 // 参数夹紧与来源识别
@@ -41,6 +43,7 @@ export class IntraAggregator {
       cooldownMs: clampNonNegInt(m.cooldownMs),
       dedupMs: clampNonNegInt(m.dedupMs),
       consensusBoost: Math.max(0, Math.min(0.3, m.consensusBoost)),
+      adaptMinByConsensus: m.adaptMinByConsensus ?? true,
     };
   }
 
@@ -56,6 +59,8 @@ export class IntraAggregator {
       cooldownMs: clampNonNegInt(m.cooldownMs),
       dedupMs: clampNonNegInt(m.dedupMs),
       consensusBoost: Math.max(0, Math.min(0.3, m.consensusBoost)),
+      adaptMinByConsensus:
+        m.adaptMinByConsensus ?? this.cfg.adaptMinByConsensus ?? true,
     };
   }
 
@@ -69,34 +74,42 @@ export class IntraAggregator {
       detDeltaStrength(ctx),
       detBreakout(ctx),
     ].filter(Boolean) as IntraSignal[];
-    if (cands.length === 0) return null;
 
     // 过滤低强度
-    const strong = cands.filter(
-      (s) => Number(s.strength) >= this.cfg.minStrength,
-    );
-    if (strong.length === 0) return null;
 
-    // 共识：按方向聚类
+    if (cands.length === 0) return null;
+
+    // 按方向分组并应用“共识自适应门槛”
     const byDir = new Map<'buy' | 'sell', IntraSignal[]>();
-    for (const s of strong) {
+    for (const s of cands) {
       const arr = byDir.get(s.dir) || [];
       arr.push(s);
       byDir.set(s.dir, arr);
     }
+    const strong: IntraSignal[] = [];
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    for (const [dir, arr] of byDir) {
+      const effMin = this.cfg.adaptMinByConsensus
+        ? clamp01(
+            this.cfg.minStrength - this.cfg.consensusBoost * (arr.length - 1),
+          )
+        : this.cfg.minStrength;
+      strong.push(...arr.filter((s) => Number(s.strength) >= effMin));
+    }
+    if (strong.length === 0) return null;
 
     // 稳定选择器：强度优先；平手按来源优先级（breakout > delta > flow）
+    // 下面保持原有“方向共识优先，其次强度最高”的选择逻辑
     const order = { breakout: 3, delta: 2, flow: 1, unknown: 0 } as const;
     const cmp = (a: IntraSignal, b: IntraSignal) => {
-      const sa = Number(a.strength);
-      const sb = Number(b.strength);
+      const sa = Number(a.strength),
+        sb = Number(b.strength);
       if (sb !== sa) return sb - sa;
       return order[srcOf(b)] - order[srcOf(a)];
     };
-
+    const buyArr = strong.filter((s) => s.dir === 'buy');
+    const sellArr = strong.filter((s) => s.dir === 'sell');
     let chosen: IntraSignal;
-    const buyArr = byDir.get('buy') || [];
-    const sellArr = byDir.get('sell') || [];
     if (buyArr.length !== sellArr.length) {
       const arr = buyArr.length > sellArr.length ? buyArr : sellArr;
       const top = [...arr].sort(cmp)[0];

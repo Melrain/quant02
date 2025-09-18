@@ -7,8 +7,12 @@ import {
 import { newWin1m, applyTrade, vwapOf, type Win1m } from './window.state';
 import type { DetectorCtx } from './detectors/intra-detectors';
 import { IntraAggregator } from './detectors/IntraAggregator';
-import { confOf } from './symbol.config';
 import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import {
+  ParamRepository,
+  type EffectiveParams,
+} from 'src/params/param.repository';
 
 type Trade = { ts: number; px: string; qty: string; side?: 'buy' | 'sell' };
 
@@ -76,7 +80,11 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
   private ewmaAbsDelta3s = new Map<string, Ewma>(); // 动态阈值参考
   private aggs = new Map<string, IntraAggregator>(); // 每个标的一个聚合器（冷却/去重/共识）
 
-  constructor(private readonly stream: RedisStreamsService) {}
+  constructor(
+    private readonly stream: RedisStreamsService,
+    private readonly eventEmitter: EventEmitter2,
+    private readonly params: ParamRepository,
+  ) {}
 
   async onModuleInit() {
     try {
@@ -93,15 +101,15 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
           this.flow3s.set(s, { buy: 0, sell: 0, buf: [] });
         this.ewmaAbsDelta3s.set(s, new Ewma(0.01));
 
-        // 聚合器初始化（参数可按品种配置）
-        const conf = confOf(s);
+        // 使用动态参数初始化聚合器
+        const eff = await this.params.getEffective(s);
         this.aggs.set(
           s,
           new IntraAggregator({
-            cooldownMs: conf.cooldownMs,
-            dedupMs: conf.dedupMs, // 按品种去重
-            minStrength: conf.minStrength, // 按品种强度门槛
-            consensusBoost: conf.consensusBoost, // 按品种共识加权
+            cooldownMs: eff.cooldownMs,
+            dedupMs: eff.dedupMs,
+            minStrength: eff.minStrength,
+            consensusBoost: eff.consensusBoost,
           }),
         );
       }
@@ -146,6 +154,9 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
             const t = this.toTrade(m.payload);
             if (!t) continue;
 
+            // 读取该符号的动态参数（带 1s 本地缓存）
+            const eff = await this.params.getEffective(m.symbol);
+
             // 1) 切桶
             const closeTs = this.getCloseTs(t.ts);
             const cur = this.win.get(m.symbol);
@@ -168,8 +179,8 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
             // 3) 刷新进行中窗口 Hash
             await this.writeWinState1m(m.symbol, w, t.ts);
 
-            // 4) 维护滑窗/近价
-            this.pushFlow3s(m.symbol, t);
+            // 4) 维护滑窗/近价（使用动态参数）
+            this.pushFlow3s(m.symbol, t, eff);
             const arr = this.lastPrices.get(m.symbol)!;
             const p = Number(t.px);
             if (Number.isFinite(p)) {
@@ -183,8 +194,8 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
               .get(m.symbol)!
               .push(Math.abs(flow.buy - flow.sell));
 
-            // 6) 检测并写信号（聚合器内含冷却/去重）
-            await this.detectAndEmit(m.symbol, w, t.ts);
+            // 6) 检测并写信号（聚合器内含冷却/去重），使用动态阈值参数
+            await this.detectAndEmit(m.symbol, w, t.ts, eff);
 
             // 7) ACK
             if (!ackMap.has(m.key)) ackMap.set(m.key, []);
@@ -213,15 +224,14 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     return { ts, px: p.px, qty: p.qty, side: (p.side as any) ?? undefined };
   }
 
-  /** 名义额滑窗（按币种乘数换算） */
-  private pushFlow3s(sym: string, t: Trade) {
+  /** 名义额滑窗（按币种乘数换算，使用动态参数） */
+  private pushFlow3s(sym: string, t: Trade, eff: EffectiveParams) {
     const f = this.flow3s.get(sym)!;
-    const conf = confOf(sym);
     const px = Number(t.px);
     const qty = Number(t.qty);
     const notional =
       Number.isFinite(px) && Number.isFinite(qty)
-        ? px * qty * conf.contractMultiplier
+        ? px * qty * eff.contractMultiplier
         : 0;
     const buy = t.side === 'buy' ? notional : 0;
     const sell = t.side === 'sell' ? notional : 0;
@@ -238,8 +248,12 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async detectAndEmit(sym: string, w: Win1m, ts: number) {
-    const conf = confOf(sym);
+  private async detectAndEmit(
+    sym: string,
+    w: Win1m,
+    ts: number,
+    eff: EffectiveParams,
+  ) {
     const f = this.flow3s.get(sym)!;
     const arr = this.lastPrices.get(sym)!;
     const dyn = this.ewmaAbsDelta3s.get(sym)!.value();
@@ -251,10 +265,11 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
       lastPrices: arr,
       buyNotional3s: f.buy,
       sellNotional3s: f.sell,
-      minNotional3s: conf.minNotional3s,
-      breakoutBandPct: conf.breakoutBandPct,
+      minNotional3s: eff.minNotional3s,
+      breakoutBandPct: eff.breakoutBandPct,
       dynAbsDelta: dyn,
-      dynDeltaK: conf.dynDeltaK,
+      dynDeltaK: eff.dynDeltaK,
+      liqK: eff.liqK,
     };
 
     const agg = this.aggs.get(sym)!;
@@ -286,10 +301,21 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
         'evidence.band': best.evidence.band ?? '',
         'evidence.eps': best.evidence.eps ?? '',
         strategyId: 'intra.v1',
-        ttlMs: String(Math.max(3000, conf.cooldownMs)),
+        ttlMs: String(Math.max(3000, eff.cooldownMs)),
       },
       { maxlenApprox: 5_000 },
     );
+
+    // 发送事件（供其他模块订阅）
+    this.eventEmitter.emit('signal.detected', {
+      ts: best.ts,
+      kind: 'intra',
+      instId: sym,
+      dir: best.dir,
+      strength: best.strength,
+      evidence: best.evidence,
+      strategyId: 'intra.v1',
+    });
   }
 
   /** 进行中 1m 窗口 Hash（win:state:1m:{sym}） */

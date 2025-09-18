@@ -6,6 +6,7 @@ import { WorkMarketModule } from './worker-market/work-market.module';
 import { RedisModule } from './redis/redis.module';
 import { RedisStreamsModule } from './redis-streams/redis-streams.module';
 import { WindowModule } from './window/window.module';
+import { ParamModule } from './params/params.module';
 
 @Module({
   imports: [
@@ -18,6 +19,7 @@ import { WindowModule } from './window/window.module';
     RedisModule,
     RedisStreamsModule,
     WindowModule,
+    ParamModule,
   ],
   controllers: [AppController],
   providers: [AppService],
