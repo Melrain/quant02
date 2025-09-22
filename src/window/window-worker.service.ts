@@ -37,6 +37,7 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 // 新增：从 symbol.config.ts 引入动态参数
 // 新增：从 symbol.config.ts 引入动态参数
 import { confOf, type SymbolConfig } from './symbol.config';
+import { parseSymbolsFromEnv } from 'src/utils/utils';
 type EffectiveParams = Required<SymbolConfig>;
 
 type Trade = { ts: number; px: string; qty: string; side?: 'buy' | 'sell' };
@@ -59,30 +60,7 @@ class Ewma {
 export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WindowWorkerService.name);
   private running = false;
-
-  // 短写 -> instId 映射，兼容已是完整 instId 的情况
-  private toInstId(token: string): string {
-    const t = token.trim();
-    if (!t) return '';
-    const u = t.toUpperCase();
-    return u.includes('-') ? u : `${u}-USDT-SWAP`;
-  }
-  // 与 okx-ws.service.ts 一致：优先 OKX_ASSETS（短写），否则 OKX_SYMBOLS（可混用）
-  private parseSymbolsFromEnv(): string[] {
-    const raw =
-      process.env.OKX_ASSETS ??
-      process.env.OKX_SYMBOLS ??
-      'btc,eth,doge,ltc,shib,pump,wlfi,xpl';
-    const list = raw
-      .split(',')
-      .map((s) => this.toInstId(s))
-      .filter(Boolean);
-    return Array.from(new Set(list));
-  }
-
-  // 订阅标的（来自环境变量；缺少专用配置时用默认 DEFAULT_SYM_CONF）
-  private readonly symbols = this.parseSymbolsFromEnv();
-
+  private readonly symbols = parseSymbolsFromEnv();
   // 参数
   private readonly FLOW_WINDOW_MS = 3_000; // 3s 滑窗
   private readonly PRICE_HIST_N = 50; // 近价缓存长度

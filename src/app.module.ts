@@ -8,9 +8,12 @@ import { RedisStreamsModule } from './redis-streams/redis-streams.module';
 import { WindowModule } from './window/window.module';
 
 import { ConfigModule } from '@nestjs/config';
+import { ScheduleModule } from '@nestjs/schedule';
+import { CronModule } from './cron/cron.module';
 
 @Module({
   imports: [
+    ScheduleModule.forRoot(),
     ConfigModule.forRoot({ isGlobal: true, envFilePath: '.env' }),
     EventEmitterModule.forRoot({
       wildcard: true,
@@ -21,6 +24,7 @@ import { ConfigModule } from '@nestjs/config';
     RedisModule,
     RedisStreamsModule,
     WindowModule,
+    CronModule,
   ],
   controllers: [AppController],
   providers: [AppService],
