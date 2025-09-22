@@ -278,19 +278,22 @@ export class OkxWsClient {
   /* ---------- Handlers → Domain events ---------- */
   private handleCandles(m: OkxDataMsg) {
     const { instId, channel } = m.arg;
+    const tf = normalizeTf(channel); // 解析出 timeframe
     const recvTs = now();
     for (const c of m.data) {
       const ev: KlineEvent = {
         type: 'market.kline',
         src: 'okx',
         instId: instId!,
-        tf: normalizeTf(channel), // '5m' | '15m' | '1h' ...
-        ts: Number(c[0]), // OKX push 的时间戳（K线开始时间）
+        tf,
+        ts: Number(c[0]),
         open: c[1],
         high: c[2],
         low: c[3],
         close: c[4],
         vol: c[5],
+        // ★ 新增：把报价币计成交额带出来（OKX 第 8 个字段）
+        quoteVol: c[7], // <= 关键
         confirm: c.length >= 9 ? (Number(c[8]) as 0 | 1) : undefined,
         ingestId: randomUUID(),
         recvTs,

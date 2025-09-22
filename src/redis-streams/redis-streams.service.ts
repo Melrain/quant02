@@ -15,18 +15,17 @@ import {
 } from './stream.types';
 
 /**
- * RedisStreamService
+ * RedisStreamsService
  *
- * 统一封装 Redis Stream 常用命令：
- *  - XADD (可选 MAXLEN~/MINID~ 控制内存)
- *  - XGROUP CREATE (ensureGroup)
- *  - XREADGROUP (批量拉取)
- *  - XACK (确认消费)
- *  - XAUTOCLAIM (认领超时 pending)
+ * 统一封装 Redis Stream 常用命令 + 若干 Hash/Key 便捷方法：
+ *  - XADD / XTRIM / XREADGROUP / XACK / XAUTOCLAIM / XRANGE / XREVRANGE(模拟)
+ *  - HSET / HGETALL / HGET / EXPIRE / GET
  *
- * 并提供统一消息结构：{ key, id, ts, symbol, kind, payload }
- * key 约定（Cluster 友好哈希标签）：ws:{<symbol>}:<kind> / ws:{<symbol>}:kline<tf>
- * 例：ws:{BTC-USDT-SWAP}:trades、ws:{BTC-USDT-SWAP}:kline1m
+ * Key 约定（Cluster 友好哈希标签）：
+ *  - 行情原始：ws:{<symbol>}:<kind> / ws:{<symbol>}:kline<tf>
+ *    例：ws:{BTC-USDT-SWAP}:trades、ws:{BTC-USDT-SWAP}:kline1m
+ *  - 输出类（派生/快照/信号等）：<base>:{<symbol>}
+ *    例：win:state:5m:{BTC-USDT-SWAP}、signal:detected:{BTC-USDT-SWAP}
  */
 @Injectable()
 export class RedisStreamsService
@@ -38,17 +37,29 @@ export class RedisStreamsService
 
   /* ------------------------------ Key Helpers ------------------------------ */
 
-  /** 业务 Stream Key（带哈希标签 + 统一前缀） */
+  /** 业务 Stream Key（带哈希标签 + 统一前缀），适合 raw stream 命令直接使用 */
   buildKey(symbol: string, kind: StreamKind) {
-    // 使用业务 key，底层 RedisClient 会统一加环境前缀
+    // 返回已前缀 key
     return `ws:{${symbol}}:${kind}`;
   }
-  /** 输出类业务 Key：如 win:1m:{sym} / signal:detected:{sym} / win:state:1m:{sym} */
+
+  /**
+   * 输出类业务 Key：如 win:1m:{sym} / signal:detected:{sym} / win:state:1m:{sym}
+   * 注意：该返回值用于 HSET/HGETALL/EXPIRE 这类“封装方法”，由 RedisClient 统一加前缀；
+   * 若要配合 raw stream 命令（xadd/xrange），请使用 buildOutStreamKey。
+   */
   buildOutKey(symbol: string, base: string) {
+    // 返回业务 key（不显式加环境前缀）
     return `${base}:{${symbol}}`;
   }
 
-  /** kline key：ws:{symbol}:kline1m / kline5m ... */
+  /** 输出类 Stream Key（已前缀版），可直接用于 raw stream 命令 */
+  buildOutStreamKey(symbol: string, base: string) {
+    // 用 RedisClient.key(...) 加环境前缀
+    return this.redis.key(`${base}:{${symbol}}`);
+  }
+
+  /** kline key：ws:{symbol}:kline1m / kline5m ...（已前缀） */
   buildKlineKey(symbol: string, timeframe: string) {
     return this.redis.key(`ws:{${symbol}}:kline${timeframe}`);
   }
@@ -62,9 +73,7 @@ export class RedisStreamsService
 
   /**
    * 写入一条消息；payload 内部全部转 string，并过滤 undefined/null。
-   * 控制策略：可选 maxlenApprox / minIdMsApprox 用于近似裁剪，防止无限增长。
-   * @param key 这里既可以传 `buildKey()` 等返回的“已前缀”key，也可以传业务 key（不带前缀），
-   *            若传业务 key，请使用 this.redis.key(key) 包装后再传入本方法。
+   * 适用于“已前缀”的 stream key（如 buildKey/buildKlineKey/buildOutStreamKey 的返回值）。
    */
   async xadd(
     key: string,
@@ -72,11 +81,7 @@ export class RedisStreamsService
     opts?: StreamWriteOptions,
   ): Promise<string> {
     const r = this.redis.raw();
-
-    // 若调用方传的是“业务 key”（不带前缀），请手动包一层：
-    // const k = this.redis.key(key);
-    // 这里默认 key 已是“已前缀的真实 key”（推荐直接用 buildKey/buildKlineKey 的返回值）
-    const k = key;
+    const k = key; // 要求传入“已前缀”的真实 key
 
     const fields: string[] = [];
     for (const [f, v] of Object.entries(payload)) {
@@ -94,10 +99,10 @@ export class RedisStreamsService
     return (await (r as any).xadd(...args)) as string;
   }
 
-  /** 裁剪：根据近似 maxlen/minid 做 XTRIM */
+  /** 裁剪：根据近似 maxlen/minid 做 XTRIM（key 需已前缀） */
   async trim(key: string, opts: StreamWriteOptions): Promise<void> {
     const r = this.redis.raw();
-    const k = key; // 同上，传入时即已前缀
+    const k = key;
     if (!opts.maxlenApprox && !opts.minIdMsApprox) return;
     const args: any[] = [k];
     if (opts.maxlenApprox) args.push('MAXLEN', '~', String(opts.maxlenApprox));
@@ -107,11 +112,7 @@ export class RedisStreamsService
 
   /* ------------------------------ Group Admin ------------------------------ */
 
-  /**
-   * 确保消费组存在；不存在则创建（忽略 BUSYGROUP 错误）。
-   * @param start '$' 表示从组创建后新消息开始；'0' 表示消费历史。
-   * @param key 传入“已前缀的真实 key”（推荐使用 buildKey 的返回值）
-   */
+  /** 确保消费组存在；不存在则创建（忽略 BUSYGROUP 错误） */
   async ensureGroup(key: string, group: string, start: '$' | '0' = '$') {
     const r = this.redis.raw();
     try {
@@ -138,21 +139,17 @@ export class RedisStreamsService
 
   /* ------------------------------ Read (Group) ----------------------------- */
 
-  /**
-   * 调用 XREADGROUP 读取多个 key；
-   * 传入的 keys 应该是“已前缀 key”（直接用 buildKey/buildKlineKey）。
-   */
+  /** XREADGROUP 读取多个 key（keys 均需已前缀） */
   async readGroup(opts: StreamReadOptions): Promise<ReadBatch | null> {
     const r = this.redis.raw();
     const { group, consumer, blockMs = 2000, count = 500 } = opts;
 
-    const ks = opts.keys; // 假设传入即为已前缀 key
+    const ks = opts.keys;
     const cursors =
       opts.cursors && opts.cursors.length === ks.length
         ? opts.cursors
         : new Array(ks.length).fill('>');
 
-    // XREADGROUP GROUP <group> <consumer> COUNT <n> BLOCK <ms> STREAMS k1 k2 ... id1 id2 ...
     const args: any[] = [
       'GROUP',
       group,
@@ -178,7 +175,7 @@ export class RedisStreamsService
 
   /* --------------------------- Read (XREVRANGE) ---------------------------- */
 
-  /** 读取某个 stream 的最近 count 条（倒序）。key 传“已前缀 key”。 */
+  /** 读取某个 stream 的最近 count 条（倒序）。key 需已前缀。 */
   async xrevrangeLatest(
     key: string,
     count = 1,
@@ -201,7 +198,7 @@ export class RedisStreamsService
     }
   }
 
-  /** 将 XREVRANGE 的 fields 数组转换为对象列表（倒序→对象）。 */
+  /** 将 XREVRANGE 的 fields 数组转换为对象列表（倒序→对象） */
   async readLatestAsObjects(
     key: string,
     count = 1,
@@ -218,7 +215,7 @@ export class RedisStreamsService
 
   /**
    * 按毫秒时间窗口读取（XRANGE），startMs/endMs 都是业务毫秒，内部转换为 "<ms>-<seq>"。
-   * 返回 entries（旧→新）。key 传“已前缀 key”。
+   * 返回 entries（旧→新）。key 需已前缀。
    */
   async xrangeByTime(
     key: string,
@@ -244,7 +241,7 @@ export class RedisStreamsService
     }
   }
 
-  /** 将 XRANGE 窗口读取转换为对象数组（旧→新）。 */
+  /** 将 XRANGE 窗口读取转换为对象数组（旧→新） */
   async readWindowAsObjects(
     key: string,
     startMs: number,
@@ -254,7 +251,9 @@ export class RedisStreamsService
     const rows = await this.xrangeByTime(key, startMs, endMs, count);
     return rows.map(([, arr]) => {
       const obj: Record<string, string> = {};
-      for (let i = 0; i < arr.length; i += 2) obj[arr[i]] = arr[i + 1];
+      for (let i = 0; i < arr.length; i += 2) {
+        obj[arr[i]] = arr[i + 1];
+      }
       return obj;
     });
   }
@@ -302,13 +301,10 @@ export class RedisStreamsService
     const messages: StreamMessage[] = [];
 
     for (const [fullKey, entries] of batch) {
-      // fullKey 如 "dev:ws:{BTC-USDT-SWAP}:kline1m" 或 "ws:{BTC-USDT-SWAP}:trades"
-      // 先去掉环境前缀（如果有）
-      const key = fullKey; // 这里保留完整 key，不做截断，下面解析时仅作 split 参考
+      const key = fullKey;
       const parts = key.split(':');
 
       // 解析 {symbol}
-      // 形式：prefix? "ws" "{SYMBOL}" "<kind>"
       const braceIndex = parts.findIndex(
         (p) => p.startsWith('{') && p.endsWith('}'),
       );
@@ -353,7 +349,7 @@ export class RedisStreamsService
     return messages;
   }
 
-  // 新增：解析业务 key -> { symbol, kind, tf }
+  // 解析业务 key -> { symbol, kind, tf }
   private parseKey(fullKey: string): {
     symbol: string;
     kind: StreamKind;
@@ -402,7 +398,7 @@ export class RedisStreamsService
 
   /**
    * 认领超时 pending（兼容 Redis 7 返回三元组格式）
-   * key 传“已前缀 key”
+   * key 需已前缀
    */
   async xautoclaim(
     key: string,
@@ -432,7 +428,7 @@ export class RedisStreamsService
     }
   }
 
-  // 新增：对多个键批量 XAUTOCLAIM（便捷）
+  // 批量 XAUTOCLAIM（便捷）
   async xautoclaimAll(
     keys: string[],
     group: string,
@@ -444,8 +440,6 @@ export class RedisStreamsService
     for (const k of keys) {
       let startId = '0-0';
       const acc: Array<[string, string[]]> = [];
-      // 迭代认领，直到拿不到更多
-      // 注意：避免死循环；每个 key 做 3 次页翻最大 ~ 3 * countPerKey
       for (let i = 0; i < 3; i++) {
         const { entries, nextStartId } = await this.xautoclaim(
           k,
@@ -464,30 +458,22 @@ export class RedisStreamsService
     return out;
   }
 
-  // src/redis-streams/redis-streams.service.ts
+  /* ------------------------------ XRANGE (compat) -------------------------- */
+
+  // 提供一个“伪 XREVRANGE”接口（若你需要旧 -> 新 -> 取尾部 -> 倒序）
   async xrevrange(
     key: string,
-    end: string = '+', // 保留参数签名，实际不使用
-    start: string = '-', // 保留参数签名，实际不使用
+    end: string = '+',
+    start: string = '-',
     count: number = 600,
   ): Promise<Array<[string, Record<string, string>]>> {
-    // 直接调用你已有的 XRANGE：从头到尾取最多 count 条
-    // 如果你的 xrange 签名不同（比如没有 count 参数），按你的实现调整
     const rows = await this.xrange(key, '-', '+', count);
-    // 取尾部 count 条并倒序，模拟 XREVRANGE 语义（新→旧）
     const tail = rows.slice(-Math.min(count, rows.length)).reverse();
     return tail;
   }
 
-  // src/redis-streams/redis-streams.service.ts
-
   /**
-   * XRANGE 封装
-   * @param key   stream 键名
-   * @param start 起始 ID（通常用 '-' 表示最旧）
-   * @param end   结束 ID（通常用 '+' 表示最新）
-   * @param count 限制条数（可选）
-   * @returns     Array<[id, Record<string,string>]>
+   * XRANGE 封装（key 需已前缀）
    */
   async xrange(
     key: string,
@@ -502,7 +488,6 @@ export class RedisStreamsService
       args.push('COUNT', count);
     }
 
-    // ioredis 有 call / send_command，不同版本名字不同
     let res: any;
     if (typeof cli?.xrange === 'function') {
       res = await cli.xrange(...args);
@@ -514,7 +499,6 @@ export class RedisStreamsService
       throw new Error('Redis client does not support XRANGE');
     }
 
-    // 把 Redis 的 [id, [k1,v1,k2,v2,...]] 转成 [id, {k1:v1,...}]
     return (res as any[]).map(([id, arr]) => [id, this.arrayToHash(arr)]);
   }
 
@@ -527,13 +511,99 @@ export class RedisStreamsService
     return h;
   }
 
-  /** Hash:  代理（自动前缀由 RedisClient 处理） */
+  /* ------------------------------ Hash / Key ------------------------------- */
+
+  /** HSET（走封装，自动前缀） */
   async hset(key: string, obj: Record<string, string | number>) {
     return this.redis.hset(key, obj);
   }
 
-  /** Key 过期（秒）代理 */
+  /** HGETALL（优先走封装；否则 raw/call 兜底），不存在返回 null */
+  async hgetall(key: string): Promise<Record<string, string> | null> {
+    // 1) 优先走封装（通常带环境前缀）
+    if (typeof (this.redis as any).hgetall === 'function') {
+      const obj = await (this.redis as any).hgetall(key);
+      if (!obj || Object.keys(obj).length === 0) return null;
+      return obj as Record<string, string>;
+    }
+
+    // 2) 兜底 raw/call
+    const cli: any =
+      this.redis.raw?.() ?? (this as any).redis ?? (this as any).client;
+    const k =
+      typeof (this.redis as any).key === 'function'
+        ? (this.redis as any).key(key)
+        : key;
+
+    let res: any;
+    if (typeof cli?.hgetall === 'function') {
+      res = await cli.hgetall(k);
+    } else if (typeof cli?.call === 'function') {
+      res = await cli.call('HGETALL', k);
+    } else if (typeof cli?.send_command === 'function') {
+      res = await cli.send_command('HGETALL', [k]);
+    } else {
+      throw new Error('Redis client does not support HGETALL');
+    }
+
+    if (Array.isArray(res)) {
+      const h: Record<string, string> = {};
+      for (let i = 0; i < res.length; i += 2) h[res[i]] = res[i + 1];
+      return Object.keys(h).length ? h : null;
+    }
+    return res && Object.keys(res).length
+      ? (res as Record<string, string>)
+      : null;
+  }
+
+  /** HGET 单字段（不存在返回 null） */
+  async hget(key: string, field: string): Promise<string | null> {
+    // 1) 优先走封装
+    if (typeof (this.redis as any).hget === 'function') {
+      const v = await (this.redis as any).hget(key, field);
+      return v ?? null;
+    }
+    // 2) 兜底 raw/call
+    const cli: any =
+      this.redis.raw?.() ?? (this as any).redis ?? (this as any).client;
+    const k =
+      typeof (this.redis as any).key === 'function'
+        ? (this.redis as any).key(key)
+        : key;
+
+    if (typeof cli?.hget === 'function')
+      return (await cli.hget(k, field)) ?? null;
+    if (typeof cli?.call === 'function')
+      return await cli.call('HGET', k, field);
+    if (typeof cli?.send_command === 'function')
+      return await cli.send_command('HGET', [k, field]);
+    throw new Error('Redis client does not support HGET');
+  }
+
+  /** EXPIRE（秒） */
   async expire(key: string, seconds: number) {
     return this.redis.expire(key, seconds);
+  }
+
+  /** GET（字符串键，计数器/速率用） */
+  async get(key: string): Promise<string | null> {
+    // 1) 优先走封装
+    if (typeof (this.redis as any).get === 'function') {
+      const v = await (this.redis as any).get(key);
+      return v ?? null;
+    }
+    // 2) 兜底 raw/call
+    const cli: any =
+      this.redis.raw?.() ?? (this as any).redis ?? (this as any).client;
+    const k =
+      typeof (this.redis as any).key === 'function'
+        ? (this.redis as any).key(key)
+        : key;
+
+    if (typeof cli?.get === 'function') return (await cli.get(k)) ?? null;
+    if (typeof cli?.call === 'function') return await cli.call('GET', k);
+    if (typeof cli?.send_command === 'function')
+      return await cli.send_command('GET', [k]);
+    throw new Error('Redis client does not support GET');
   }
 }
