@@ -1,7 +1,6 @@
 /* eslint-disable @typescript-eslint/no-unused-vars */
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
-import { clear } from 'console';
 import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
 import { parseSymbolsFromEnv } from 'src/utils/utils';
 
@@ -30,7 +29,6 @@ type DynGateParams = {
   rateExc: number;
   eventFlag: number;
   oiRegime: number;
-
   updated_at: number;
   version: string;
 };
@@ -79,35 +77,22 @@ export class MarketEnvUpdaterService {
     sym: string,
     now: number,
   ): Promise<EnvFactors> {
-    const bars5m = await this.streams.xrange(`win:5m:${sym}`, '-', '+', 50);
-    const bars15m = await this.streams.xrange(`win:15m:${sym}`, '-', '+', 50);
-
     // TODO: 实际计算函数，比如 calcVolPct(bars5m, bars15m)
     const volPct = 0.5; // placeholder
     const liqPct = 0.5; // placeholder
 
     // 2) 读取 OI
-    const oiRows = await this.streams.xrange(`qt:raw:oi:${sym}`, '-', '+', 20);
+
     // TODO: 对比近/远期 OI 算 regime
     const oiRegime: -1 | 0 | 1 = 0;
 
     // 3) 读取 funding
-    const fundingRows = await this.streams.xrevrange(
-      `qt:raw:funding:${sym}`,
-      '+',
-      '-',
-      1,
-    );
+
     // TODO: 判断离下次 funding 是否 <5min
     const eventFlag: 0 | 1 = 0;
 
     // 4) 读取信号流，算速率异常
-    const signals = await this.streams.xrange(
-      `win:${sym}:signal:detected`,
-      '-',
-      '+',
-      100,
-    );
+
     // TODO: 最近 60s 信号数 / 期望速率
     const rateExc = 0;
 

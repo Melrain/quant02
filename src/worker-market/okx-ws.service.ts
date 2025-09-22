@@ -13,30 +13,26 @@ type BookDepth = Parameters<OkxWsClient['subscribeOrderBook']>[1];
 @Injectable()
 export class OkxWsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OkxWsService.name);
+  private subscribedArgs: { channel: string; instId: string }[] = []; // 可选：记录退订
 
-  // 将短写 token 映射为 OKX instId；若已是完整 instId 则原样（转大写）
   private toInstId(token: string): string {
     const t = token.trim();
     if (!t) return '';
     const u = t.toUpperCase();
-    // 已经是完整 instId（包含连字符），例如 BTC-USDT-SWAP
     if (u.includes('-')) return u;
-    // 短写 -> 统一映射到 USDT 永续
     return `${u}-USDT-SWAP`;
   }
 
-  // 解析环境变量：支持短写（btc,eth,...）或完整（BTC-USDT-SWAP,ETH-USDT-SWAP,...）
   private parseSymbolsFromEnv(): string[] {
-    // 优先 OKX_ASSETS（短写），否则用 OKX_SYMBOLS（可短写或全称）
     const raw =
       process.env.OKX_ASSETS ??
       process.env.OKX_SYMBOLS ??
-      'btc,eth,doge,ltc,shib,pump,wlfi,xpl'; // 默认短写
+      'btc,eth,doge,ltc,shib,pump,wlfi,xpl';
     const list = raw
       .split(',')
       .map((s) => this.toInstId(s))
       .filter(Boolean);
-    return Array.from(new Set(list)); // 去重
+    return Array.from(new Set(list));
   }
 
   constructor(
@@ -51,26 +47,42 @@ export class OkxWsService implements OnModuleInit, OnModuleDestroy {
     this.bus.on('okx.error', (e: any) =>
       this.logger.warn(`OKX WS error: ${e?.message ?? e}`),
     );
-    this.bus.on('okx.subscribed', (arg: any) =>
-      this.logger.log(`Subscribed ${JSON.stringify(arg)}`),
-    );
+    this.bus.on('okx.subscribed', (arg: any) => {
+      this.logger.log(`Subscribed ${JSON.stringify(arg)}`);
+      if (arg?.channel && arg?.instId) {
+        this.subscribedArgs.push({ channel: arg.channel, instId: arg.instId });
+      }
+    });
     this.bus.on('okx.unsubscribed', (arg: any) =>
       this.logger.log(`Unsubscribed ${JSON.stringify(arg)}`),
     );
 
-    // 使用短写/混合环境变量
     const instIds = this.parseSymbolsFromEnv();
     this.logger.log(`Bootstrapping OKX symbols: ${instIds.join(', ')}`);
 
     await this.client.connect();
-    await this.bootstrapSymbols(instIds);
+    await this.bootstrapSymbols(instIds, {
+      trades: true,
+      tickers: true,
+      bookDepth: 'books5',
+      candles: ['5m', '15m'], // ★ 默认订阅 5m/15m
+    });
   }
 
   async onModuleDestroy() {
+    // 可选：优雅退订（不是必须）
+    try {
+      if (this.subscribedArgs.length) {
+        await this.client.unsubscribe(this.subscribedArgs);
+      }
+    } catch (e) {
+      this.logger.warn(
+        `unsubscribe on destroy failed: ${(e as Error).message}`,
+      );
+    }
     await this.client.close();
   }
 
-  // 对外便捷 API（转调 client）
   connect() {
     return this.client.connect();
   }
@@ -103,7 +115,6 @@ export class OkxWsService implements OnModuleInit, OnModuleDestroy {
     return this.client.subscribeFundingRate(instId);
   }
 
-  // 可选：一键批量订阅
   async bootstrapSymbols(
     instIds: string[],
     opts?: {
@@ -111,16 +122,17 @@ export class OkxWsService implements OnModuleInit, OnModuleDestroy {
       tickers?: boolean;
       bookDepth?: BookDepth;
       candles?: CandleBar[];
+      oi?: boolean;
+      funding?: boolean;
     },
   ) {
     const want = {
       trades: true,
       tickers: true,
       bookDepth: 'books5' as BookDepth,
-      candles: [] as CandleBar[],
+      candles: ['5m', '15m'] as CandleBar[],
       oi: true,
       funding: true,
-
       ...(opts ?? {}),
     };
     for (const s of instIds) {
@@ -128,7 +140,6 @@ export class OkxWsService implements OnModuleInit, OnModuleDestroy {
       if (want.tickers) await this.client.subscribeTickers(s);
       if (want.oi) await this.client.subscribeOpenInterest(s);
       if (want.funding) await this.client.subscribeFundingRate(s);
-
       if (want.bookDepth)
         await this.client.subscribeOrderBook(s, want.bookDepth);
       for (const b of want.candles) await this.client.subscribeCandles(s, b);

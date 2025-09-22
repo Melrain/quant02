@@ -50,6 +50,7 @@ export type KlineEvent = {
   confirm?: 0 | 1; // OKX candle 的第9列，1=已收盘，0=进行中
   ingestId?: string; // 数据源标识，便于追溯
   recvTs?: number; // 数据接收时间，便于追溯
+  quoteVol?: string; // 计价币种成交量（可选）
 };
 
 // 持仓兴趣(OpenInterestEvent)
