@@ -69,6 +69,7 @@ const pctChange = (a: number, b: number) => (b - a) / (Math.abs(a) + EPS);
 export class MarketEnvUpdaterService {
   private readonly logger = new Logger(MarketEnvUpdaterService.name);
   private readonly symbols = parseSymbolsFromEnv();
+  private oiState = new Map<string, { dir: -1 | 0 | 1; since: number }>();
 
   constructor(private readonly streams: RedisStreamsService) {}
 
@@ -126,7 +127,11 @@ export class MarketEnvUpdaterService {
     // const lookbackMs = 45 * 60_000;
     const lookbackMs = 90 * 60_000; // 近 90 分钟，样本更充足
     const series = await this.readOiSeries(sym, now - lookbackMs, now);
-    const oiRegime = this.calcOiRegime(series);
+    const rawRegime = this.calcOiRegime(series); // 仍然用严格 AND 阈值
+    let oiRegime = this.enforcePersistence(sym, rawRegime, now);
+
+    // 环境共识：低波动/低活跃直接屏蔽 OI 影响
+    if (volPct < 0.4 || liqPct < 0.4) oiRegime = 0;
 
     // ---- 3) Funding 事件近窗 ----
     const fundStateKey = this.streams.buildOutKey(sym, 'state:funding');
@@ -155,14 +160,14 @@ export class MarketEnvUpdaterService {
 
     // 强度门槛：高波动/事件/速率异常/加减仓 → 抬高
     const effMin0 = Math.min(
-      0.8,
+      0.78, // 顶
       Math.max(
-        0.58,
+        0.6, // 底
         baseMinStrength +
-          0.06 * (f.volPct > 0.75 ? 1 : 0) +
-          0.06 * Math.min(1, f.rateExc) +
+          0.05 * (f.volPct > 0.8 ? 1 : 0) +
+          0.05 * Math.min(1, f.rateExc) +
           0.08 * f.eventFlag +
-          0.04 * (f.oiRegime !== 0 ? 1 : 0),
+          0.02 * (f.oiRegime !== 0 ? 1 : 0), // OI 只加一点点
       ),
     );
 
@@ -363,6 +368,31 @@ export class MarketEnvUpdaterService {
     if (pct >= pctTh && zLike >= zTh) return 1;
     if (pct <= -pctTh && zLike <= -zTh) return -1;
     return 0;
+  }
+  // 在 calcOiRegime 之后，加一个“持续性滤波”
+  private enforcePersistence(
+    sym: string,
+    raw: -1 | 0 | 1,
+    now: number,
+  ): -1 | 0 | 1 {
+    const cur = this.oiState.get(sym) ?? { dir: 0, since: now };
+    if (raw === 0) {
+      // 一旦回到0，清空状态更保守
+      this.oiState.set(sym, { dir: 0, since: now });
+      return 0;
+    }
+    if (raw === cur.dir) {
+      // 同向累计时长
+      const heldMs = now - cur.since;
+      const NEED_MS = 10 * 60_000; // 持续10分钟
+      if (heldMs >= NEED_MS) return raw; // 通过持续性门槛
+      // 未达标前，仍视作 0
+      return 0;
+    } else {
+      // 切向，重新计时
+      this.oiState.set(sym, { dir: raw, since: now });
+      return 0; // 先观察，不立刻生效
+    }
   }
 
   /** 读取最近一段时间的 OI 数列（旧→新），优先用 oiCcy，没有再用 oi */
