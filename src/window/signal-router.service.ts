@@ -106,18 +106,17 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
             if (Number.isFinite(ts)) {
               const lat = Date.now() - ts;
               if (lat >= 0 && lat < 24 * 3600_000 && sym) {
-                this.metrics.observeRouterLatency(sym, lat);
+                this.metrics.observeRouterLatency(sym, lat, dir || 'na', src);
               }
             }
 
-            // 字段缺失：直接 ACK 丢弃 + drop 计数
+            // ……字段缺失：直接丢弃……
             if (
               !sym ||
               !Number.isFinite(ts) ||
               !(dir === 'buy' || dir === 'sell')
             ) {
-              // 记录为 bad row（共用 strength 原因也可，但这里不区分）
-              this.metrics.incDrop(sym || 'na', dir || 'buy', 'strength');
+              this.metrics.incDrop(sym || 'na', 'na' as any, 'bad_row', src);
               this.safeAck(ackMap, m.key, m.id);
               continue;
             }
