@@ -3,8 +3,10 @@
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 import { Injectable, Logger } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
+import { MetricsService } from 'src/metrics/metrics.service';
 import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
 import { parseSymbolsFromEnv } from 'src/utils/utils';
+import { FundingBootstrapService } from 'src/worker-market/funding-bootstrap.service';
 
 /* ===================== 内部类型（非 DTO） ===================== */
 type EnvFactors = {
@@ -71,7 +73,18 @@ export class MarketEnvUpdaterService {
   private readonly symbols = parseSymbolsFromEnv();
   private oiState = new Map<string, { dir: -1 | 0 | 1; since: number }>();
 
-  constructor(private readonly streams: RedisStreamsService) {}
+  constructor(
+    private readonly streams: RedisStreamsService,
+    private readonly fundingBootstrapService: FundingBootstrapService,
+    private readonly metrics: MetricsService, // <—— 新增
+  ) {}
+
+  async onModuleInit() {
+    const symbols = parseSymbolsFromEnv();
+    for (const s of symbols) {
+      await this.fundingBootstrapService.bootstrapFundingHistory(s);
+    }
+  }
 
   /** 每 10s 跑一次（你也可以改成 */ @Cron('*/10 * * * * *') /** ）*/
   async updateMarketEnv() {
@@ -84,6 +97,18 @@ export class MarketEnvUpdaterService {
       try {
         const factors = await this.computeEnvFactors(sym, now);
         const params = this.mapFactorsToParams(sym, factors, now);
+
+        // 🔥 统一走 MetricsService
+        this.metrics.setDynGateExtended(sym, {
+          effMin0: params.effMin0,
+          minNotional3s: params.minNotional3s,
+          volPct: params.volPct,
+          liqPct: params.liqPct,
+          oiRegime: params.oiRegime,
+          cooldownMs: params.cooldownMs,
+          breakoutBandPct: params.breakoutBandPct,
+        });
+
         await this.writeSnapshot(sym, params);
         this.logger.log(
           `[dyn.gate] ${sym} effMin0=${params.effMin0.toFixed(2)} minNotional3s=${params.minNotional3s} ` +

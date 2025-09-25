@@ -1,0 +1,32 @@
+services:
+  prometheus:
+    image: prom/prometheus:v2.53.1
+    container_name: prometheus
+    ports: ['9090:9090']
+    volumes:
+      - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+
+  grafana:
+    image: grafana/grafana:10.4.3
+    container_name: grafana
+    ports: ['3000:3000']
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_USERS_DEFAULT_THEME=dark
+    volumes:
+      # 1) provisioning 目录（数据源/仪表盘 provider）
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      # 2) 仪表盘 JSON 的实际存放目录（与 dashboard.yml 的 path 对应）
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # 3) 可选：持久化 grafana 数据（若希望每次都重新导入，可移除并配合 down -v）
+      - grafana-storage:/var/lib/grafana
+
+volumes:
+  grafana-storage:

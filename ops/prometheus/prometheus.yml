@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  # 抓 Prometheus 自己
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # 抓你的 Nest 服务
+  - job_name: 'quant02-nest'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:8080'] # <= 关键

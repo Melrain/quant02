@@ -1,99 +1,95 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+1. 信号日志字段（[signal] ...）
+   [signal] inst=BTC-USDT-SWAP dir=buy strength=0.792 src=flow
+   notional3s=17894071 (buy=17889579 sell=4492 min=3000000)
+   delta3s=17885086.70 zLike= buyShare3s=1.000 breakout=
+   | params: cm=1 minNotional3s=3000000 band=0.012 dynK=1.8 liqK=1.2
+   minStrength=0.7 cb=0.1 cooldown=9000 dedup=4000 dynAbsDelta=12376520
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+inst
+合约/标的，例如 BTC-USDT-SWAP
+dir
+信号方向，buy 或 sell
+strength
+信号强度，范围 0~1；越高表示越强
+src
+信号来源 detector：flow（资金流）、delta（统计异常）、breakout（价格突破）
+notional3s
+近 3 秒总名义额（计价币）
+(buy=..., sell=...)
+近 3 秒买入 / 卖出名义额拆分
+min=...
+动态参数里的 最小名义额门槛（低于此值时信号通常不触发）
+delta3s
+近 3 秒买卖差（buy - sell）
+zLike
+类似 Z-score 的统计量（大于 2 表示较强的统计异常）
+buyShare3s
+买方占比：buy / (buy+sell)
+breakout
+是否突破，1 表示突破成立，空表示无
+cm
+contractMultiplier：合约乘数，用于把成交量换算为名义额
+minNotional3s
+生效的最小 3s 名义额门槛
+band
+突破带宽（相对价格百分比），例如 0.012 表示 ±1.2%
+dynK
+动态阈值缩放系数（越大表示阈值更严格）
+liqK
+流动性缩放系数（按深度/流动性调整的权重）
+minStrength
+信号最小强度门槛（低于此值不会发出信号）
+cb
+consensusBoost：共识折扣系数，多 detector 同向时可降低门槛
+cooldown
+同向信号冷却时间（毫秒）
+dedup
+去重窗口（毫秒），避免短期内重复信号
+dynAbsDelta
+动态参考指标：EWMA
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+2. 环境更新日志字段（[dyn.gate] ...）
+   [dyn.gate] BTC-USDT-SWAP effMin0=0.70 minNotional3s=2000
+   cooldown=9600 band=0.0241 (volPct=0.41 liqPct=0.00 oiRegime=0)
 
-## Description
+字段解释:
+effMin0
+动态计算的有效信号门槛（最终 minStrength 起点），例如 0.70
+minNotional3s
+动态设定的最小 3s 名义额门槛（低于此值不触发信号）
+cooldown
+动态计算后的冷却时间（毫秒），高波动期通常更长
+band
+动态突破带宽，通常基于波动度调整
+volPct
+波动百分位，0~1，数值越高说明当前波动率接近历史高分位
+liqPct
+流动性百分位，0~1，越低表示流动性稀薄
+oiRegime
+持仓量 regime，0 表示中性，还没识别出明显 regime；后期可能为 ±1 表示强趋势/强背离状态
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+3. 使用建议
+   • 看 strength + effMin0：
+   - strength >= effMin0 才是有效信号
+   - effMin0 会随环境动态变化，比固定门槛更合理
+     • 看 notional3s vs minNotional3s：
+   - 小币种低于门槛会被过滤
+   - 大币种必须显著超过门槛才算强信号
+     • 看 volPct 与 band：
+   - 高波动时 band 会变宽，避免假突破
+   - volPct≈1.0 表示市场极度活跃，冷却时间也更长
+     • 看 oiRegime 与 liqPct：
+   - OI regime 用于长期趋势判别（目前初版大多为 0）
+   - liqPct≈0 表示盘口几乎没深度，信号可靠性要打折
 
-## Project setup
-
-```bash
-$ npm install
-```
-
-## Compile and run the project
-
-```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
-```
-
-## Run tests
-
-```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
-```
-
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
-# quant02
+4. [MarketEnvUpdaterService] [dyn.oi] n=18 A=680853 B=679863 pct=0.15% z=0.56
+   n=18
+   已收集到的样本点数量（比如近 18 个 5m/15m 桶里的 OI 数据）
+   A=680853
+   序列前半段（历史一侧）的平均 OI 值或加权和
+   B=679863
+   序列后半段（近期一侧）的平均 OI 值或加权和
+   pct=0.15%
+   (B - A) / A，即近期 OI 相对过去的变化百分比
+   z=0.56
+   类 Z-score，表示 OI 变化相对于序列波动的标准化程度；绝对值越大越“异常”

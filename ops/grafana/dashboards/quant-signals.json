@@ -1,0 +1,240 @@
+{
+  "uid": "quant-signals",
+  "title": "Quant Signals - Overview",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "version": 1,
+  "tags": ["quant", "signals", "prometheus"],
+  "editable": true,
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+
+  "templating": {
+    "list": [
+      {
+        "name": "ds",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": { "text": "prometheus", "value": "prometheus" },
+        "hide": 0,
+        "label": "Datasource"
+      },
+      {
+        "name": "instId",
+        "label": "Symbol",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "$ds" },
+        "refresh": 2,
+        "query": "label_values(signal_final_total, instId)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] }
+      },
+      {
+        "name": "dir",
+        "label": "Direction",
+        "type": "custom",
+        "includeAll": true,
+        "multi": true,
+        "query": "buy,sell",
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] }
+      }
+    ]
+  },
+
+  "panels": [
+    {
+      "type": "row",
+      "title": "Rates",
+      "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 }
+    },
+
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Final signals / min",
+      "description": "rate(signal_final_total[1m])，可选符号/方向过滤",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(signal_final_total{instId=~\"$instId\", dir=~\"$dir\"}[1m])",
+          "legendFormat": "{{instId}} {{dir}}"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 1, "w": 12, "h": 8 },
+      "options": {
+        "legend": { "showLegend": true },
+        "tooltip": { "mode": "single" }
+      }
+    },
+
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Detected vs Final / min",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instId) (rate(signal_detected_total{instId=~\"$instId\", dir=~\"$dir\"}[1m]))",
+          "legendFormat": "detected - {{instId}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (instId) (rate(signal_final_total{instId=~\"$instId\", dir=~\"$dir\"}[1m]))",
+          "legendFormat": "final - {{instId}}"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 1, "w": 12, "h": 8 },
+      "options": {
+        "legend": { "showLegend": true },
+        "tooltip": { "mode": "single" }
+      }
+    },
+
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Drop reasons / min",
+      "description": "三类 drop 的速率：strength / cooldown / dedup",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(signal_drop_strength_total{instId=~\"$instId\", dir=~\"$dir\"}[1m]))",
+          "legendFormat": "drop.strength"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(signal_drop_cooldown_total{instId=~\"$instId\", dir=~\"$dir\"}[1m]))",
+          "legendFormat": "drop.cooldown"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(signal_drop_dedup_total{instId=~\"$instId\", dir=~\"$dir\"}[1m]))",
+          "legendFormat": "drop.dedup"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 9, "w": 12, "h": 8 },
+      "options": {
+        "legend": { "showLegend": true },
+        "tooltip": { "mode": "single" }
+      }
+    },
+
+    {
+      "id": 4,
+      "type": "bargauge",
+      "title": "Top symbols by final rate (5m)",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(5, sum by (instId) (rate(signal_final_total[5m])))",
+          "legendFormat": "{{instId}}"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 9, "w": 12, "h": 8 },
+      "options": {
+        "displayMode": "gradient",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"] }
+      }
+    },
+
+    {
+      "type": "row",
+      "title": "Cumulative",
+      "gridPos": { "x": 0, "y": 17, "w": 24, "h": 1 }
+    },
+
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Final signals total (filtered)",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(signal_final_total{instId=~\"$instId\", dir=~\"$dir\"})"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 18, "w": 6, "h": 5 }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Detected signals total (filtered)",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(signal_detected_total{instId=~\"$instId\", dir=~\"$dir\"})"
+        }
+      ],
+      "gridPos": { "x": 6, "y": 18, "w": 6, "h": 5 }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Drops total (filtered)",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(signal_drop_strength_total{instId=~\"$instId\", dir=~\"$dir\"}) + sum(signal_drop_cooldown_total{instId=~\"$instId\", dir=~\"$dir\"}) + sum(signal_drop_dedup_total{instId=~\"$instId\", dir=~\"$dir\"})"
+        }
+      ],
+      "gridPos": { "x": 12, "y": 18, "w": 6, "h": 5 }
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Drop ratio (final / detected)",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "1 - ( sum(rate(signal_final_total{instId=~\"$instId\", dir=~\"$dir\"}[5m])) / clamp_min(sum(rate(signal_detected_total{instId=~\"$instId\", dir=~\"$dir\"}[5m])), 1e-9) )"
+        }
+      ],
+      "gridPos": { "x": 18, "y": 18, "w": 6, "h": 5 }
+    },
+
+    {
+      "type": "row",
+      "title": "Latest finals",
+      "gridPos": { "x": 0, "y": 23, "w": 24, "h": 1 }
+    },
+
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Recent final signals (last 20 by instId/dir)",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {}
+          }
+        }
+      ],
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(20, signal_final_total{instId=~\"$instId\", dir=~\"$dir\"})",
+          "legendFormat": "{{instId}} {{dir}}"
+        }
+      ],
+      "options": {
+        "showHeader": true,
+        "footer": { "show": false }
+      },
+      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 7 }
+    }
+  ]
+}

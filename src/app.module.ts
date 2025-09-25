@@ -10,6 +10,9 @@ import { WindowModule } from './window/window.module';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { CronModule } from './cron/cron.module';
+import { DynGateReaderModule } from './dyn-gate-reader/dyn-gate-reader.module';
+import { ObservabilityModule } from './observability/obeservability.module';
+import { MetricsModule } from './metrics/metrics.module';
 
 @Module({
   imports: [
@@ -25,6 +28,9 @@ import { CronModule } from './cron/cron.module';
     RedisStreamsModule,
     WindowModule,
     CronModule,
+    DynGateReaderModule,
+    ObservabilityModule,
+    MetricsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -475,31 +475,50 @@ export class RedisStreamsService
   /**
    * XRANGE 封装（key 需已前缀）
    */
+  // 统一 XRANGE 调用，兼容不同 ioredis 版本
   async xrange(
     key: string,
     start: string = '-',
     end: string = '+',
     count?: number,
   ): Promise<Array<[string, Record<string, string>]>> {
-    const cli: any = (this as any).redis || (this as any).client;
+    const r: any = this.redis.raw(); // ★ 正确获取底层 ioredis 实例
 
     const args: (string | number)[] = [key, start, end];
-    if (count) {
+    if (count && count > 0) {
       args.push('COUNT', count);
     }
 
     let res: any;
-    if (typeof cli?.xrange === 'function') {
-      res = await cli.xrange(...args);
-    } else if (typeof cli?.call === 'function') {
-      res = await cli.call('XRANGE', ...args);
-    } else if (typeof cli?.send_command === 'function') {
-      res = await cli.send_command('XRANGE', args);
-    } else {
-      throw new Error('Redis client does not support XRANGE');
+    try {
+      if (typeof r.xrange === 'function') {
+        // ioredis 直接有 xrange 方法
+        res = await r.xrange(...args);
+      } else if (typeof r.call === 'function') {
+        // 通用 call
+        res = await r.call('XRANGE', ...args);
+      } else if (typeof r.send_command === 'function') {
+        // 老版本 send_command
+        res = await r.send_command('XRANGE', args);
+      } else if (typeof r.sendCommand === 'function') {
+        // 新版 sendCommand(Command)
+        // 避免直接依赖 ioredis.Command 类型，这里改用 call 语义
+        res = await r.call('XRANGE', ...args);
+      } else {
+        throw new Error('XRANGE not available on redis client');
+      }
+    } catch (e) {
+      this.logger.debug(
+        `xrange failed: ${key} [${start}, ${end}] -> ${(e as Error).message}`,
+      );
+      throw e;
     }
 
-    return (res as any[]).map(([id, arr]) => [id, this.arrayToHash(arr)]);
+    // Redis 返回: [id, [k1,v1,k2,v2,...]][]
+    return (res ?? []).map(([id, arr]: [string, string[]]) => [
+      id,
+      this.arrayToHash(arr),
+    ]);
   }
 
   /** 小工具：把 [k1,v1,k2,v2,...] 转成 {k1:v1,...} */

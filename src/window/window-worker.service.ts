@@ -1,27 +1,17 @@
-// window-worker.service.ts
+/* eslint-disable @typescript-eslint/no-unused-vars */
+/* eslint-disable @typescript-eslint/no-unsafe-return */
+
+// src/window/window-worker.service.ts
 // 负责：
 //  - 读 trades 流，按 1m 切桶并写 win:1m 流
 //  - 滑窗统计近3s 名义额流入（买/卖）
 //  - 缓存近价（用于简单趋势/统计）
 //  - 检测信号（基于近3s 流入 + 近价行为）
-//  - 写信号流 win:signal:detected
+//  - 写信号流 signal:detected:{sym}
 //  - 写进行中窗口 Hash（win:state:1m/{sym}，以及 5m/15m）
-//  - 向上滚动 5m/15m 窗口（win:5m/15m + win:state:5m/15m/{sym}）
+//  - 向上滚动 5m/15m 窗口（win:5m/15m + win:state:5m/15m/{sym})
 //
-// 基于 Redis Streams + Hash 实现，单进程单消费者
-//
-// 参数：
-//  - 标的列表：环境变量 OKX_ASSETS（短写，优先）或 OKX_SYMBOLS（可混用）
-//  - 窗口参数：常量
-//  - 信号检测参数：来自 symbol.config.ts（可按标的覆盖）
-//
-// 注意：
-//  - 本模块不直接与交易所交互，依赖 Redis Streams 作为数据总线
-//  - 本模块不直接与交易模块交互，信号通过 Redis Stream 输出，供其他模块订阅
-//  - 本模块不负责持久化任何运行态，所有中间态均存于 Redis（可重启恢复）
-//  - 本模块假设单进程单消费者运行（无分片），否则会有重复信号
-//  - 本模块假设系统时钟单调递增，否则可能出现异常
-//  - 本模块假设 Redis 可用且性能良好，否则会阻塞
+// 依赖：Redis Streams + Hash；单进程单消费者
 
 import {
   Injectable,
@@ -29,15 +19,20 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
+import { parseSymbolsFromEnv } from 'src/utils/utils';
+
+// 窗口聚合
 import { newWin1m, applyTrade, vwapOf, type Win1m } from './window.state';
+
+// 检测 & 聚合
 import type { DetectorCtx } from './detectors/intra-detectors';
 import { IntraAggregator } from './detectors/IntraAggregator';
-import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
-import { EventEmitter2 } from '@nestjs/event-emitter';
-// 新增：从 symbol.config.ts 引入动态参数
-// 新增：从 symbol.config.ts 引入动态参数
+
+// 动态参数（由 symbol.config.ts 汇总基础配置 + dyn gate）
 import { confOf, type SymbolConfig } from './symbol.config';
-import { parseSymbolsFromEnv } from 'src/utils/utils';
+
 type EffectiveParams = Required<SymbolConfig>;
 
 type Trade = { ts: number; px: string; qty: string; side?: 'buy' | 'sell' };
@@ -60,74 +55,70 @@ class Ewma {
 export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WindowWorkerService.name);
   private running = false;
+
+  // 标的列表
   private readonly symbols = parseSymbolsFromEnv();
-  // 参数
+
+  // 固定参数
   private readonly FLOW_WINDOW_MS = 3_000; // 3s 滑窗
   private readonly PRICE_HIST_N = 50; // 近价缓存长度
   private readonly TF5M_MS = 5 * 60_000;
   private readonly TF15M_MS = 15 * 60_000;
 
   // 运行态
-  private win = new Map<string, Win1m>(); // 当前 1m 窗口
+  private win = new Map<string, Win1m>(); // 当前 1m
   private win5m = new Map<string, Win1m>();
   private win15m = new Map<string, Win1m>();
-  private lastPrices = new Map<string, number[]>(); // 近N价缓存（用于简单趋势/统计）
-  //临时变量，储存近3秒买卖名义额滑窗
+
+  private lastPrices = new Map<string, number[]>(); // 近N价
   private flow3s = new Map<
     string,
     {
       buy: number;
       sell: number;
       buf: Array<{ ts: number; buy: number; sell: number }>;
-      maxTs: number; // 该标的已见到的最大事件时间，用于严格剪裁
+      maxTs: number; // 已见到的最大事件时间（严格窗口剪裁）
     }
-  >(); // 近3秒滑窗（名义额）
-  private ewmaAbsDelta3s = new Map<string, Ewma>(); // 动态阈值参考
-  private aggs = new Map<string, IntraAggregator>(); // 每个标的一个聚合器（冷却/去重/共识）
+  >();
 
-  // 参数快照：仅当变化时打印
+  private ewmaAbsDelta3s = new Map<string, Ewma>(); // |delta3s| 平滑
+  private aggs = new Map<string, IntraAggregator>(); // 每标的一套聚合器（含冷却/去重）
+
+  // 生效参数缓存 + 变化日志去抖
+  private effCache = new Map<string, { ts: number; eff: EffectiveParams }>();
   private lastEffSnapshot = new Map<string, string>(); // sym -> JSON
 
-  // 新增：1s 本地缓存
-  private effCache = new Map<string, { ts: number; eff: EffectiveParams }>();
-  private getEff(sym: string, now: number): EffectiveParams {
-    const c = this.effCache.get(sym);
-    if (c && now - c.ts < 1000) return c.eff;
-    const eff = confOf(sym);
-    this.effCache.set(sym, { ts: now, eff });
-    return eff;
-  }
-
   constructor(
-    private readonly stream: RedisStreamsService,
+    private readonly streams: RedisStreamsService,
     private readonly eventEmitter: EventEmitter2,
   ) {}
 
+  /* --------------------------------- 生命周期 -------------------------------- */
+
   async onModuleInit() {
     try {
-      // 确保组存在（仅 trades）
+      // 确保消费组存在（trades）
       const tradeKeys = this.symbols.map((s) =>
-        this.stream.buildKey(s, 'trades'),
+        this.streams.buildKey(s, 'trades'),
       );
-      await this.stream.ensureGroups(tradeKeys, 'cg:window', '$');
+      await this.streams.ensureGroups(tradeKeys, 'cg:window', '$');
 
-      // 初始化容器
+      // 初始化 per-symbol 状态
+      const now = Date.now();
       for (const s of this.symbols) {
-        if (!this.lastPrices.has(s)) this.lastPrices.set(s, []);
-        if (!this.flow3s.has(s))
-          this.flow3s.set(s, { buy: 0, sell: 0, buf: [], maxTs: 0 });
+        this.lastPrices.set(s, []);
+        this.flow3s.set(s, { buy: 0, sell: 0, buf: [], maxTs: 0 });
         this.ewmaAbsDelta3s.set(s, new Ewma(0.01));
 
-        // 使用动态参数初始化聚合器
-        const eff = this.getEff(s, Date.now());
+        const eff = this.getEff(s, now);
         this.logger.log(
           `[param.effective:init] ${s} ` +
-            `cm=${eff.contractMultiplier} ` +
-            `minNotional3s=${eff.minNotional3s} ` +
+            `cm=${eff.contractMultiplier} minNotional3s=${eff.minNotional3s} ` +
             `cooldown=${eff.cooldownMs} dedup=${eff.dedupMs} ` +
             `minStrength=${eff.minStrength} cb=${eff.consensusBoost} ` +
             `band=${eff.breakoutBandPct} K=${eff.dynDeltaK} liqK=${eff.liqK}`,
         );
+
         this.aggs.set(
           s,
           new IntraAggregator({
@@ -137,21 +128,8 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
           }),
         );
 
-        // 记录首个快照（避免启动后第一条 trade 又打印一次 change）
-        this.lastEffSnapshot.set(
-          s,
-          JSON.stringify({
-            cm: eff.contractMultiplier,
-            minN: eff.minNotional3s,
-            cd: eff.cooldownMs,
-            dd: eff.dedupMs,
-            ms: eff.minStrength,
-            cb: eff.consensusBoost,
-            band: eff.breakoutBandPct,
-            K: eff.dynDeltaK,
-            lq: eff.liqK,
-          }),
-        );
+        // 保存初始快照，避免第一条成交就“变化”
+        this.lastEffSnapshot.set(s, this.snapshotStr(eff));
       }
 
       this.running = true;
@@ -167,16 +145,16 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     this.running = false;
   }
 
-  private getCloseTs(ts: number) {
-    return Math.floor(ts / 60_000) * 60_000 + 60_000;
-  }
+  /* ----------------------------------- 主循环 -------------------------------- */
 
   private async loop() {
     const consumer = `window#${process.pid}`;
     while (this.running) {
       try {
-        const keys = this.symbols.map((s) => this.stream.buildKey(s, 'trades'));
-        const batch = await this.stream.readGroup({
+        const keys = this.symbols.map((s) =>
+          this.streams.buildKey(s, 'trades'),
+        );
+        const batch = await this.streams.readGroup({
           group: 'cg:window',
           consumer,
           keys,
@@ -185,7 +163,7 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
         });
         if (!batch) continue;
 
-        const msgs = this.stream.normalizeBatch(batch);
+        const msgs = this.streams.normalizeBatch(batch);
         const ackMap = new Map<string, string[]>();
 
         for (const m of msgs) {
@@ -194,37 +172,20 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
             const t = this.toTrade(m.payload);
             if (!t) continue;
 
-            // 读取该符号的动态参数（带 1s 本地缓存）
+            // 读取生效参数（带 1s 本地缓存）
             const eff = this.getEff(m.symbol, Date.now());
-            // 打印“参数变化”日志（不刷屏）
-            const snapNow = JSON.stringify({
-              cm: eff.contractMultiplier,
-              minN: eff.minNotional3s,
-              cd: eff.cooldownMs,
-              dd: eff.dedupMs,
-              ms: eff.minStrength,
-              cb: eff.consensusBoost,
-              band: eff.breakoutBandPct,
-              K: eff.dynDeltaK,
-              lq: eff.liqK,
-            });
-            const snapPrev = this.lastEffSnapshot.get(m.symbol);
-            if (snapPrev !== snapNow) {
-              this.lastEffSnapshot.set(m.symbol, snapNow);
-              this.logger.log(
-                `[param.effective:change] ${m.symbol} ${snapNow}`,
-              );
-            }
+            this.logEffChangeIfNeeded(m.symbol, eff);
 
-            // 1) 切桶
+            // 1) 1m 切桶
             const closeTs = this.getCloseTs(t.ts);
             const cur = this.win.get(m.symbol);
             if (!cur || cur.closeTs !== closeTs) {
               if (cur) {
                 const gap = closeTs - cur.closeTs > 60_000;
-                await this.seal1m(m.symbol, cur, gap); // 封旧桶（写 Stream + 向上滚）
+                await this.seal1m(m.symbol, cur, gap); // 封旧桶，并向上滚
               }
               this.win.set(m.symbol, newWin1m(closeTs, t.px));
+              // 确保容器存在
               if (!this.lastPrices.has(m.symbol))
                 this.lastPrices.set(m.symbol, []);
               if (!this.flow3s.has(m.symbol))
@@ -240,10 +201,10 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
             const w = this.win.get(m.symbol)!;
             applyTrade(w, t.px, t.qty, t.side);
 
-            // 3) 刷新进行中窗口 Hash
+            // 3) 刷“进行中 1m 状态” Hash
             await this.writeWinState1m(m.symbol, w, t.ts);
 
-            // 4) 维护滑窗/近价（使用动态参数）
+            // 4) 维护 3s 滑窗与近价
             this.pushFlow3s(m.symbol, t, eff);
             const arr = this.lastPrices.get(m.symbol)!;
             const p = Number(t.px);
@@ -252,13 +213,11 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
               if (arr.length > this.PRICE_HIST_N) arr.shift();
             }
 
-            // 5) 动态阈值参考（EWMA |delta3s|）
-            const flow = this.flow3s.get(m.symbol)!;
-            this.ewmaAbsDelta3s
-              .get(m.symbol)!
-              .push(Math.abs(flow.buy - flow.sell));
+            // 5) 动态阈值 EWMA(|delta3s|)
+            const f = this.flow3s.get(m.symbol)!;
+            this.ewmaAbsDelta3s.get(m.symbol)!.push(Math.abs(f.buy - f.sell));
 
-            // 6) 检测并写信号（聚合器内含冷却/去重），使用动态阈值参数
+            // 6) 检测 & 输出信号
             await this.detectAndEmit(m.symbol, w, t.ts, eff);
 
             // 7) ACK
@@ -271,12 +230,19 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
           }
         }
 
+        // 统一 ACK
         for (const [key, ids] of ackMap)
-          if (ids.length) await this.stream.ack(key, 'cg:window', ids);
+          if (ids.length) await this.streams.ack(key, 'cg:window', ids);
       } catch (e) {
         this.logger.error('loop iteration error', e as Error);
       }
     }
+  }
+
+  /* --------------------------------- 工具方法 -------------------------------- */
+
+  private getCloseTs(ts: number) {
+    return Math.floor(ts / 60_000) * 60_000 + 60_000;
   }
 
   private toTrade(p: Record<string, string>): Trade | null {
@@ -288,11 +254,43 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     return { ts, px: p.px, qty: p.qty, side: (p.side as any) ?? undefined };
   }
 
-  /** 名义额滑窗（按币种乘数换算，使用动态参数） */
+  private snapshotStr(eff: EffectiveParams) {
+    return JSON.stringify({
+      cm: eff.contractMultiplier,
+      minN: eff.minNotional3s,
+      cd: eff.cooldownMs,
+      dd: eff.dedupMs,
+      ms: eff.minStrength,
+      cb: eff.consensusBoost,
+      band: eff.breakoutBandPct,
+      K: eff.dynDeltaK,
+      lq: eff.liqK,
+    });
+  }
+
+  private logEffChangeIfNeeded(sym: string, eff: EffectiveParams) {
+    const nowStr = this.snapshotStr(eff);
+    const prev = this.lastEffSnapshot.get(sym);
+    if (nowStr !== prev) {
+      this.lastEffSnapshot.set(sym, nowStr);
+      this.logger.log(`[param.effective:change] ${sym} ${nowStr}`);
+    }
+  }
+
+  /** 1s 本地缓存：合并 symbol.config.ts & dyn gate 的生效参数 */
+  private getEff(sym: string, now: number): EffectiveParams {
+    const c = this.effCache.get(sym);
+    if (c && now - c.ts < 1000) return c.eff;
+    const eff = confOf(sym);
+    this.effCache.set(sym, { ts: now, eff });
+    return eff;
+  }
+
+  /** 3s 名义额滑窗（严格窗口：使用 maxTs 剪裁） */
   private pushFlow3s(sym: string, t: Trade, eff: EffectiveParams) {
     const f = this.flow3s.get(sym)!;
-    // 使用已见到的最大事件时间做剪裁，避免乱序/延迟污染窗口
     f.maxTs = Math.max(f.maxTs, t.ts);
+
     const px = Number(t.px);
     const qty = Number(t.qty);
     const notional =
@@ -302,17 +300,16 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     const buy = t.side === 'buy' ? notional : 0;
     const sell = t.side === 'sell' ? notional : 0;
 
-    f.buf.push({ ts: t.ts, buy, sell });
-    f.buy += buy;
-    f.sell += sell;
-
     const cutoff = f.maxTs - this.FLOW_WINDOW_MS;
-    // 丢弃早于窗口的迟到数据，保持严格 3s 语义
+
+    // 只在事件仍落在窗口内时计入（避免乱序导致窗口膨胀）
     if (t.ts >= cutoff) {
       f.buf.push({ ts: t.ts, buy, sell });
       f.buy += buy;
       f.sell += sell;
     }
+
+    // 严格剪裁窗口左侧
     while (f.buf.length && f.buf[0].ts < cutoff) {
       const x = f.buf.shift()!;
       f.buy -= x.buy;
@@ -320,113 +317,82 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  /**
-   * 基于当前 1m 窗口与近3秒名义额流入，检测盘中信号并输出。
-   *
-   * 调用时机：
-   *  - 每条成交在已应用到 1m 窗口（applyTrade）、滑窗（pushFlow3s）、近价之后调用。
-   *
-   * 输入参数：
-   *  - sym: 标的 instId
-   *  - w:   当前“进行中”的 1m 窗口（包含最新 OHLC、成交量、VWAP 累计等）
-   *  - ts:  当前成交时间戳（毫秒）
-   *  - eff: 生效的动态参数（来自 symbol.config.ts；包含 minNotional3s、band、dynDeltaK、liqK 等）
-   *
-   * 依赖运行态：
-   *  - this.flow3s.get(sym): 近3秒买/卖名义额滑窗（单位：计价币名义额）
-   *  - this.lastPrices.get(sym): 近价序列（用于简单趋势/统计）
-   *  - this.ewmaAbsDelta3s.get(sym): |delta3s| 的 EWMA，作为动态阈值参考（越大代表近期波动/流入越活跃）
-   *
-   * 流程：
-   *  1) 汇集上下文（DetectorCtx）：当前时间、标的、进行中 1m、近价、3s 买/卖名义额、动态/静态阈值。
-   *  2) 调用聚合器 detect(ctx)：内部做多路检测，并带冷却与去重，输出最优信号 best 或 null。
-   *  3) 若产生信号：
-   *     - 打印一条可读性较强的日志，便于回放与排障；
-   *     - 写入 Redis Stream: win:{sym}:signal:detected（通过 buildOutKey），包含 evidence.* 细节；
-   *     - 通过事件总线 eventEmitter.emit('signal.detected', ...) 广播给进程内订阅者。
-   *
-   * 注意：
-   *  - 冷却/去重在 IntraAggregator 内部完成，避免在高频成交下重复触发。
-   *  - ttlMs 取 max(3000, cooldownMs)，保证下游在冷却期内能感知该信号。
-   *  - evidence.* 字段是探测过程中的解释性指标（如 delta3s、zLike、buyShare3s、breakout、band、eps 等），便于分析。
-   */
+  /* ------------------------------ 检测 & 输出信号 ------------------------------ */
+
   private async detectAndEmit(
     sym: string,
     w: Win1m,
     ts: number,
     eff: EffectiveParams,
   ) {
-    // 近3秒买/卖名义额统计（pushFlow3s 已更新）
+    // 近3s买/卖名义额
     const f = this.flow3s.get(sym)!;
-    // 近价序列（用于简单趋势/统计）
+    // 近价序列
     const arr = this.lastPrices.get(sym)!;
-    // 动态阈值参考：|delta3s| 的 EWMA（近似近1h），反映近期活跃度/波动强度
+    // 动态阈值参考：EWMA(|delta3s|)
     const dyn = this.ewmaAbsDelta3s.get(sym)!.value();
 
-    // 组装检测上下文，供聚合器使用
+    // 统一检测上下文
     const ctx: DetectorCtx = {
-      now: ts, // 当前检测时刻（毫秒）
-      sym, // 标的
-      win: w, // 当前 1m 窗口（进行中）
-      lastPrices: arr, // 近价序列
-      buyNotional3s: f.buy, // 近3s 买入名义额
-      sellNotional3s: f.sell, // 近3s 卖出名义额
-      minNotional3s: eff.minNotional3s, // 最小活跃度门槛
-      breakoutBandPct: eff.breakoutBandPct, // 突破带宽参数（相对）
-      dynAbsDelta: dyn, // 动态阈值：EWMA(|delta3s|)
-      dynDeltaK: eff.dynDeltaK, // 动态阈值缩放系数
-      liqK: eff.liqK, // 流动性相关系数（用于放大/缩小阈值）
+      now: ts,
+      sym,
+      win: w,
+      lastPrices: arr,
+      buyNotional3s: f.buy,
+      sellNotional3s: f.sell,
+      minNotional3s: eff.minNotional3s,
+      breakoutBandPct: eff.breakoutBandPct,
+      dynAbsDelta: dyn,
+      dynDeltaK: eff.dynDeltaK,
+      liqK: eff.liqK,
     };
 
-    // 聚合器内含：多路 detector + 冷却 + 去重 + 共识规则
+    // 聚合器（内含：多路 detector + 冷却 + 去重 + 共识）
     const agg = this.aggs.get(sym)!;
     const best = agg.detect(ctx);
-    if (!best) return; // 无信号则退出
+    if (!best) return;
 
-    // 统计项仅用于日志展示（总名义额与买/卖拆分）
+    // 日志（结构化）
     const sum3s = f.buy + f.sell;
-    // 参数快照字符串（便于回放定位阈值）
     const paramStr =
       `cm=${eff.contractMultiplier} minNotional3s=${eff.minNotional3s} ` +
       `band=${eff.breakoutBandPct} dynK=${eff.dynDeltaK} liqK=${eff.liqK} ` +
       `minStrength=${eff.minStrength} cb=${eff.consensusBoost} ` +
       `cooldown=${eff.cooldownMs} dedup=${eff.dedupMs} dynAbsDelta=${dyn.toFixed(0)}`;
 
-    // 结构化日志，便于检索/复盘
     this.logger.log(
-      `[signal] inst=${sym} dir=${best.dir} strength=${best.strength} src=${best.evidence.src ?? ''} ` +
+      `[signal] inst=${sym} dir=${best.dir} strength=${best.strength} src=${best.evidence?.src ?? ''} ` +
         `notional3s=${sum3s.toFixed(0)} (buy=${f.buy.toFixed(0)} sell=${f.sell.toFixed(0)} min=${eff.minNotional3s}) ` +
-        `delta3s=${best.evidence.delta3s ?? ''} zLike=${best.evidence.zLike ?? ''} ` +
-        `buyShare3s=${best.evidence.buyShare3s ?? ''} breakout=${best.evidence.breakout ?? ''} ` +
+        `delta3s=${best.evidence?.delta3s ?? ''} zLike=${best.evidence?.zLike ?? ''} ` +
+        `buyShare3s=${best.evidence?.buyShare3s ?? ''} breakout=${best.evidence?.breakout ?? ''} ` +
         `| params: ${paramStr}`,
     );
 
-    // 输出到 Redis Stream：供跨进程/跨语言模块订阅
-    const signalKey = this.stream.buildOutKey(sym, 'signal:detected');
-    await this.stream.xadd(
+    // 输出到 Redis Stream（跨进程订阅）
+    const signalKey = this.streams.buildOutKey(sym, 'signal:detected');
+    await this.streams.xadd(
       signalKey,
       {
-        ts: String(best.ts), // 信号时间（通常等于 ctx.now）
-        kind: 'intra', // 策略大类：盘中
-        instId: sym, // 标的
-        dir: best.dir, // 方向：buy/sell
-        strength: best.strength, // 强度：由聚合器评估
-        // 解释性证据（各 detector 的核心指标）
-        'evidence.src': best.evidence.src ?? '',
-        'evidence.delta3s': best.evidence.delta3s ?? '',
-        'evidence.zLike': best.evidence.zLike ?? '',
-        'evidence.buyShare3s': best.evidence.buyShare3s ?? '',
-        'evidence.notional3s': best.evidence.notional3s ?? '',
-        'evidence.breakout': best.evidence.breakout ?? '',
-        'evidence.band': best.evidence.band ?? '',
-        'evidence.eps': best.evidence.eps ?? '',
-        strategyId: 'intra.v1', // 策略/版本标识
-        ttlMs: String(Math.max(3000, eff.cooldownMs)), // 建议下游视为“有效期”
+        ts: String(best.ts),
+        kind: 'intra',
+        instId: sym,
+        dir: best.dir,
+        strength: best.strength,
+        'evidence.src': best.evidence?.src ?? '',
+        'evidence.delta3s': best.evidence?.delta3s ?? '',
+        'evidence.zLike': best.evidence?.zLike ?? '',
+        'evidence.buyShare3s': best.evidence?.buyShare3s ?? '',
+        'evidence.notional3s': best.evidence?.notional3s ?? '',
+        'evidence.breakout': best.evidence?.breakout ?? '',
+        'evidence.band': best.evidence?.band ?? '',
+        'evidence.eps': best.evidence?.eps ?? '',
+        strategyId: 'intra.v1',
+        ttlMs: String(Math.max(3000, eff.cooldownMs)),
       },
-      { maxlenApprox: 5_000 }, // 控制流长度，避免无限增长
+      { maxlenApprox: 5_000 },
     );
 
-    // 进程内事件广播（Nest 事件总线），便于本进程内的其他服务响应
+    // 进程内广播
     this.eventEmitter.emit('signal.detected', {
       ts: best.ts,
       kind: 'intra',
@@ -438,10 +404,12 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
+  /* ------------------------------ 写入窗口状态/滚动 ----------------------------- */
+
   /** 进行中 1m 窗口 Hash（win:state:1m:{sym}） */
   private async writeWinState1m(sym: string, w: Win1m, nowTs: number) {
-    const key = this.stream.buildOutKey(sym, 'win:state:1m');
-    await this.stream.hset(key, {
+    const key = this.streams.buildOutKey(sym, 'win:state:1m');
+    await this.streams.hset(key, {
       startTs: String(w.startTs),
       closeTs: String(w.closeTs),
       updatedTs: String(nowTs),
@@ -456,14 +424,14 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
       vwapDen: String(w.vwapDen),
       tickN: String(w.tickN),
     });
-    await this.stream.expire(key, 10 * 60); // 10 分钟（秒）
+    await this.streams.expire(key, 10 * 60); // sec
   }
 
   /** 封 1m 条（写 win:1m）并向上滚 5m/15m */
   private async seal1m(sym: string, s: Win1m, gap: boolean) {
     const vwap = vwapOf(s);
-    const key = this.stream.buildOutKey(sym, 'win:1m');
-    await this.stream.xadd(
+    const key = this.streams.buildOutKey(sym, 'win:1m');
+    await this.streams.xadd(
       key,
       {
         ts: String(s.closeTs),
@@ -484,7 +452,7 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     await this.rollUpFrom1m(sym, s);
   }
 
-  // === 1m → 5m/15m 滚动 ===
+  // 1m → 5m/15m
   private async rollUpFrom1m(sym: string, m1: Win1m) {
     await this.rollUpGeneric(sym, m1, '5m', this.TF5M_MS, this.win5m);
     await this.rollUpGeneric(sym, m1, '15m', this.TF15M_MS, this.win15m);
@@ -537,7 +505,7 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     w.vwapNum += m1.vwapNum;
     w.vwapDen += m1.vwapDen;
 
-    // 刷新进行中 TF Hash
+    // 刷进行中 TF Hash
     await this.writeWinStateTf(sym, w, tfName, Date.now());
   }
 
@@ -548,8 +516,8 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     gap: boolean,
   ) {
     const vwap = vwapOf(s);
-    const key = this.stream.buildOutKey(sym, `win:${tfName}`);
-    await this.stream.xadd(
+    const key = this.streams.buildOutKey(sym, `win:${tfName}`);
+    await this.streams.xadd(
       key,
       {
         ts: String(s.closeTs),
@@ -574,8 +542,8 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
     tfName: '5m' | '15m',
     nowTs: number,
   ) {
-    const key = this.stream.buildOutKey(sym, `win:state:${tfName}`);
-    await this.stream.hset(key, {
+    const key = this.streams.buildOutKey(sym, `win:state:${tfName}`);
+    await this.streams.hset(key, {
       startTs: String(w.startTs),
       closeTs: String(w.closeTs),
       updatedTs: String(nowTs),
@@ -590,6 +558,6 @@ export class WindowWorkerService implements OnModuleInit, OnModuleDestroy {
       vwapDen: String(w.vwapDen),
       tickN: String(w.tickN),
     });
-    await this.stream.expire(key, 10 * 60);
+    await this.streams.expire(key, 10 * 60); // sec
   }
 }
