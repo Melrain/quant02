@@ -1,64 +1,61 @@
 {
-  "uid": "quant-signals",
-  "title": "量化信号 - 总览",
+  "title": "Quant Signals - Diagnostics",
   "timezone": "browser",
   "schemaVersion": 38,
-  "version": 3,
-  "tags": ["quant", "signals", "prometheus"],
+  "version": 1,
   "editable": true,
   "refresh": "5s",
   "time": { "from": "now-1h", "to": "now" },
-
+  "tags": ["quant", "signals", "prometheus", "diagnostics"],
   "templating": {
     "list": [
       {
         "name": "ds",
         "type": "datasource",
         "query": "prometheus",
-        "current": { "text": "prometheus", "value": "prometheus" },
-        "hide": 0,
-        "label": "数据源"
+        "current": { "text": "Prometheus", "value": "Prometheus" },
+        "label": "Datasource",
+        "hide": 0
       },
       {
         "name": "sym",
-        "label": "交易对",
+        "label": "Symbol",
         "type": "query",
         "datasource": { "type": "prometheus", "uid": "$ds" },
         "refresh": 2,
         "query": "label_values(quant_signals_final_total, sym)",
         "includeAll": true,
         "multi": true,
-        "current": { "selected": true, "text": ["全部"], "value": ["$__all"] }
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] }
       },
       {
         "name": "dir",
-        "label": "方向",
+        "label": "Direction",
         "type": "custom",
+        "query": "buy,sell",
         "includeAll": true,
         "multi": true,
-        "query": "buy,sell",
-        "current": { "selected": true, "text": ["全部"], "value": ["$__all"] }
+        "current": { "selected": true, "text": ["All"], "value": ["$__all"] }
       }
     ]
   },
-
   "panels": [
     {
       "type": "row",
-      "title": "速率指标",
+      "title": "Rates",
       "gridPos": { "x": 0, "y": 0, "w": 24, "h": 1 }
     },
 
     {
-      "id": 1,
+      "id": 101,
       "type": "timeseries",
-      "title": "最终信号 / 每分钟",
-      "description": "sum by (sym,dir)(rate(quant_signals_final_total[1m]))",
+      "title": "Final / min",
+      "description": "sum by (sym,dir) (rate(quant_signals_final_total[1m]))",
       "datasource": { "type": "prometheus", "uid": "$ds" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (sym,dir) (rate(quant_signals_final_total{sym=~\"$sym\",dir=~\"$dir\"}[1m]))",
+          "expr": "sum by (sym,dir) (rate(quant_signals_final_total{sym=~\"$sym\", dir=~\"$dir\"}[1m]))",
           "legendFormat": "{{sym}} {{dir}}"
         }
       ],
@@ -70,20 +67,20 @@
     },
 
     {
-      "id": 2,
+      "id": 102,
       "type": "timeseries",
-      "title": "检测 vs 最终 / 每分钟",
+      "title": "Detected vs Final / min",
       "datasource": { "type": "prometheus", "uid": "$ds" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (sym) (rate(quant_signals_detected_total{sym=~\"$sym\",dir=~\"$dir\"}[1m]))",
-          "legendFormat": "检测 - {{sym}}"
+          "expr": "sum by (sym) (rate(quant_signals_detected_total{sym=~\"$sym\", dir=~\"$dir\"}[1m]))",
+          "legendFormat": "detected - {{sym}}"
         },
         {
           "refId": "B",
-          "expr": "sum by (sym) (rate(quant_signals_final_total{sym=~\"$sym\",dir=~\"$dir\"}[1m]))",
-          "legendFormat": "最终 - {{sym}}"
+          "expr": "sum by (sym) (rate(quant_signals_final_total{sym=~\"$sym\", dir=~\"$dir\"}[1m]))",
+          "legendFormat": "final - {{sym}}"
         }
       ],
       "gridPos": { "x": 12, "y": 1, "w": 12, "h": 8 },
@@ -94,19 +91,22 @@
     },
 
     {
-      "id": 3,
+      "id": 201,
       "type": "timeseries",
-      "title": "丢弃原因 / 每分钟",
-      "description": "sum by (reason)(rate(quant_router_dropped_total[1m]))",
+      "title": "Drops / min (by reason)",
+      "description": "rate(quant_router_dropped_total[5m]) 按 reason 堆叠",
       "datasource": { "type": "prometheus", "uid": "$ds" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (reason) (rate(quant_router_dropped_total{sym=~\"$sym\",dir=~\"$dir\"}[1m]))",
-          "legendFormat": "丢弃.{{reason}}"
+          "expr": "sum by (reason) (rate(quant_router_dropped_total{sym=~\"$sym\", dir=~\"$dir\"}[5m]))",
+          "legendFormat": "{{reason}}"
         }
       ],
       "gridPos": { "x": 0, "y": 9, "w": 12, "h": 8 },
+      "fieldConfig": {
+        "defaults": { "custom": { "stacking": { "mode": "normal" } } }
+      },
       "options": {
         "legend": { "showLegend": true },
         "tooltip": { "mode": "single" }
@@ -114,104 +114,111 @@
     },
 
     {
-      "id": 4,
+      "id": 202,
       "type": "bargauge",
-      "title": "按最终信号速率排名前5 (5分钟)",
+      "title": "Top symbols by final rate (5m)",
       "datasource": { "type": "prometheus", "uid": "$ds" },
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(5, sum by (sym) (rate(quant_signals_final_total[5m])))",
+          "expr": "topk(5, sum by (sym) (rate(quant_signals_final_total{dir=~\"$dir\"}[5m])))",
           "legendFormat": "{{sym}}"
         }
       ],
       "gridPos": { "x": 12, "y": 9, "w": 12, "h": 8 },
       "options": {
         "displayMode": "gradient",
-        "orientation": "horizontal",
         "reduceOptions": { "calcs": ["lastNotNull"] }
       }
     },
 
     {
       "type": "row",
-      "title": "累计指标",
+      "title": "KPIs",
       "gridPos": { "x": 0, "y": 17, "w": 24, "h": 1 }
     },
 
     {
-      "id": 5,
+      "id": 301,
       "type": "stat",
-      "title": "最终信号总数 (筛选)",
+      "title": "Final total (filtered)",
       "datasource": { "type": "prometheus", "uid": "$ds" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(quant_signals_final_total{sym=~\"$sym\",dir=~\"$dir\"})"
+          "expr": "sum(quant_signals_final_total{sym=~\"$sym\", dir=~\"$dir\"})"
         }
       ],
       "gridPos": { "x": 0, "y": 18, "w": 6, "h": 5 }
     },
     {
-      "id": 6,
+      "id": 302,
       "type": "stat",
-      "title": "检测信号总数 (筛选)",
+      "title": "Detected total (filtered)",
       "datasource": { "type": "prometheus", "uid": "$ds" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(quant_signals_detected_total{sym=~\"$sym\",dir=~\"$dir\"})"
+          "expr": "sum(quant_signals_detected_total{sym=~\"$sym\", dir=~\"$dir\"})"
         }
       ],
       "gridPos": { "x": 6, "y": 18, "w": 6, "h": 5 }
     },
     {
-      "id": 7,
+      "id": 303,
       "type": "stat",
-      "title": "丢弃总数 (筛选)",
+      "title": "Drops total (filtered)",
       "datasource": { "type": "prometheus", "uid": "$ds" },
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(quant_router_dropped_total{sym=~\"$sym\",dir=~\"$dir\"})"
+          "expr": "sum(quant_router_dropped_total{sym=~\"$sym\", dir=~\"$dir\"})"
         }
       ],
       "gridPos": { "x": 12, "y": 18, "w": 6, "h": 5 }
     },
     {
-      "id": 8,
+      "id": 304,
       "type": "stat",
-      "title": "丢弃比例 (最终 / 检测)",
+      "title": "Pass ratio (final / detected, 5m)",
       "datasource": { "type": "prometheus", "uid": "$ds" },
       "targets": [
         {
           "refId": "A",
-          "expr": "1 - ( sum(rate(quant_signals_final_total{sym=~\"$sym\",dir=~\"$dir\"}[5m])) / clamp_min(sum(rate(quant_signals_detected_total{sym=~\"$sym\",dir=~\"$dir\"}[5m])), 1e-9) )"
+          "expr": "sum(rate(quant_signals_final_total{sym=~\"$sym\", dir=~\"$dir\"}[5m])) / clamp_min(sum(rate(quant_signals_detected_total{sym=~\"$sym\", dir=~\"$dir\"}[5m])), 1e-9)"
         }
       ],
       "gridPos": { "x": 18, "y": 18, "w": 6, "h": 5 }
     },
 
     {
-      "type": "row",
-      "title": "最新最终信号",
-      "gridPos": { "x": 0, "y": 23, "w": 24, "h": 1 }
-    },
-
-    {
-      "id": 9,
-      "type": "table",
-      "title": "最近 15 分钟内前20个最终信号",
+      "id": 401,
+      "type": "timeseries",
+      "title": "Router latency p95 (ms, 5m)",
       "datasource": { "type": "prometheus", "uid": "$ds" },
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(20, increase(quant_signals_final_total{sym=~\"$sym\",dir=~\"$dir\"}[15m]))",
-          "legendFormat": "{{sym}} {{dir}}"
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(quant_router_latency_ms_bucket{sym=~\"$sym\", dir=~\"$dir\"}[5m])))"
+        }
+      ],
+      "gridPos": { "x": 0, "y": 23, "w": 12, "h": 7 }
+    },
+
+    {
+      "id": 402,
+      "type": "table",
+      "title": "Recent finals (last 20 by sym/dir/src)",
+      "datasource": { "type": "prometheus", "uid": "$ds" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(20, quant_signals_final_total{sym=~\"$sym\", dir=~\"$dir\"})",
+          "legendFormat": "{{sym}} {{dir}} {{src}}"
         }
       ],
       "options": { "showHeader": true, "footer": { "show": false } },
-      "gridPos": { "x": 0, "y": 24, "w": 24, "h": 7 }
+      "gridPos": { "x": 12, "y": 23, "w": 12, "h": 7 }
     }
   ]
 }

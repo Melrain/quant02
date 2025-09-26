@@ -217,7 +217,7 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
               src,
             });
 
-            this.logger.log(
+                   this.logger.log(
               `[signal.final] inst=${sym} dir=${dir} st=${strength.toFixed(3)} src=${src} cool=${cool}`,
             );
 

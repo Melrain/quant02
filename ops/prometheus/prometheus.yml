@@ -1,15 +1,36 @@
 global:
-  scrape_interval: 5s
-  evaluation_interval: 5s
+  scrape_interval: 5s # 采集周期
+  evaluation_interval: 15s # 规则评估周期
+  scrape_timeout: 4s
+
+# 如果你暂时没有 Alertmanager，可以先不配；只加载本地告警规则文件
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+# 可选：如果你之后要远端写入或多集群，这里可以加 external_labels
+# external_labels:
+#   cluster: quant-local
 
 scrape_configs:
-  # 抓 Prometheus 自己
-  - job_name: 'prometheus'
+  # 采集 Prometheus 自身
+  - job_name: prometheus
     static_configs:
       - targets: ['localhost:9090']
 
-  # 抓你的 Nest 服务
-  - job_name: 'quant02-nest'
+  # 采集 Nest 应用的 /metrics
+  # 注意：Docker Desktop 下 host.docker.internal 可以直接访问宿主机；
+  # 如果是原生 Linux，请改成宿主机 IP（例如 172.17.0.1:8080）
+  - job_name: quant02-nest
     metrics_path: /metrics
     static_configs:
-      - targets: ['host.docker.internal:8080'] # <= 关键
+      - targets:
+          - 'host.docker.internal:8080'
+        labels:
+          env: dev
+          app: quant02
+
+    # 可选：统一改 instance 标签，避免不同主机名导致时间序列割裂
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        replacement: host.docker.internal:8080

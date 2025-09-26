@@ -31,6 +31,13 @@ export class MetricsService {
   private readonly routerLatency: Histogram<string>;
   private readonly routerPublishMs: Histogram<string>;
 
+  // 在类字段里新增
+  private readonly evalTotal: Counter<string>;
+  private readonly evalWin: Counter<string>;
+  private readonly evalLoss: Counter<string>;
+  private readonly evalRetBp: Histogram<string>;
+  private readonly evalOpenJobs: Gauge<string>;
+
   constructor() {
     // 采集 Node 默认指标，统一前缀 quant_
     collectDefaultMetrics({
@@ -126,6 +133,44 @@ export class MetricsService {
       buckets: [1, 2, 5, 10, 20, 50, 100, 200],
       registers: [this.registry],
     });
+
+    this.evalTotal = new Counter({
+      name: 'quant_eval_total',
+      help: 'Total evaluated signals',
+      labelNames: ['sym', 'hz', 'dir'] as const,
+      registers: [this.registry],
+    });
+
+    this.evalWin = new Counter({
+      name: 'quant_eval_win_total',
+      help: 'Wins (retBp >= 0)',
+      labelNames: ['sym', 'hz', 'dir'] as const,
+      registers: [this.registry],
+    });
+
+    this.evalLoss = new Counter({
+      name: 'quant_eval_loss_total',
+      help: 'Losses (retBp < 0)',
+      labelNames: ['sym', 'hz', 'dir'] as const,
+      registers: [this.registry],
+    });
+
+    this.evalRetBp = new Histogram({
+      name: 'quant_eval_ret_bp',
+      help: 'Return in basis points per evaluated signal',
+      labelNames: ['sym', 'hz', 'dir'] as const,
+      buckets: [
+        -100, -50, -20, -10, -5, -2, -1, -0.5, 0, 0.5, 1, 2, 5, 10, 20, 50, 100,
+      ],
+      registers: [this.registry],
+    });
+
+    this.evalOpenJobs = new Gauge({
+      name: 'quant_eval_open_jobs',
+      help: 'Open evaluation jobs in memory',
+      labelNames: [] as const,
+      registers: [this.registry],
+    });
   }
 
   // 给 /metrics 控制器用
@@ -199,5 +244,27 @@ export class MetricsService {
     if (Number.isFinite(ms) && ms >= 0) {
       this.routerPublishMs.labels(sym, stage).observe(ms);
     }
+  }
+
+  // 在类方法里新增
+  incEvalTotal(sym: string, hz: string, dir: 'buy' | 'sell') {
+    this.evalTotal.labels(sym, hz, dir).inc();
+  }
+  incEvalWin(sym: string, hz: string, dir: 'buy' | 'sell') {
+    this.evalWin.labels(sym, hz, dir).inc();
+  }
+  incEvalLoss(sym: string, hz: string, dir: 'buy' | 'sell') {
+    this.evalLoss.labels(sym, hz, dir).inc();
+  }
+  observeEvalReturn(
+    sym: string,
+    hz: string,
+    dir: 'buy' | 'sell',
+    retBp: number,
+  ) {
+    this.evalRetBp.labels(sym, hz, dir).observe(retBp);
+  }
+  setEvalOpenJobs(n: number) {
+    this.evalOpenJobs.set(n);
   }
 }

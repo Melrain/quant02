@@ -1,0 +1,57 @@
+groups:
+  - name: quant-runtime
+    rules:
+      # 1) 有 detected 但没有 final（router/门槛异常）
+      - alert: RouterNoFinalButDetected
+        expr: sum(rate(quant_signals_detected_total[5m])) > 0
+          and sum(rate(quant_signals_final_total[5m])) == 0
+        for: 3m
+        labels:
+          severity: page
+        annotations:
+          summary: 'Router 有检测无放行'
+          description: '近5m detected>0 但 final=0，检查 effMin0/cooldown、router 日志与 Redis。'
+
+      # 2) strength 丢弃激增
+      - alert: DropStrengthSpike
+        expr: increase(quant_router_dropped_total{reason="strength"}[10m]) > 100
+        for: 1m
+        labels:
+          severity: warn
+        annotations:
+          summary: '大量 strength 丢弃'
+          description: '10m 内 strength drop >100，可能行情切 regime 或门槛过高。'
+
+      # 3) router 延迟分位数过高（p95 > 3s）
+      - alert: RouterLatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(quant_router_latency_ms_bucket[5m]))
+          ) > 3000
+        for: 2m
+        labels:
+          severity: warn
+        annotations:
+          summary: 'Router 延迟高'
+          description: '近5m p95(router_latency_ms) > 3s，检查链路与 Redis。'
+
+      # 4) exporter 掉线（Nest /metrics 不可达）
+      - alert: NestExporterDown
+        expr: up{job="quant02-nest"} == 0
+        for: 1m
+        labels:
+          severity: page
+        annotations:
+          summary: 'Nest /metrics 不可达'
+          description: 'Prometheus 无法采集 8080/metrics，请检查容器/端口。'
+
+      # 5) 目标缺失（Prometheus 自身 sanity）
+      - alert: AnyTargetMissing
+        expr: count(up) < 2
+        for: 1m
+        labels:
+          severity: warn
+        annotations:
+          summary: '部分 scrape target 掉线'
+          description: 'up < 2，请在 /targets 页面确认具体 job。'
