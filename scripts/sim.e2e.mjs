@@ -38,7 +38,7 @@ const argv = yargs(hideBin(process.argv))
   .option('srcs', { type: 'string', default: process.env.SRCS || 'manual' })
   .option('scrapeWaitMs', {
     type: 'number',
-    default: Number(process.env.SCRAPE_WAIT_MS || 7000),
+    default: Number(process.env.SCRAPE_WAIT_MS || 20000),
   })
   .option('loadRate', {
     type: 'number',
@@ -106,12 +106,16 @@ function labels(obj = {}) {
     '}'
   );
 }
-
+function withoutSrc(f) {
+  const { src, ...rest } = f || {};
+  return rest;
+}
 async function getCounters(filter = {}) {
   const detQ = `${MET.detected}${labels(filter)}`;
   const finQ = `${MET.final}${labels(filter)}`;
-  const dropStrengthQ = `${MET.dropped}${labels({ ...filter, reason: 'strength' })}`;
-  const dropCooldownQ = `${MET.dropped}${labels({ ...filter, reason: 'cooldown' })}`;
+
+  const dropStrengthQ = `${MET.dropped}${labels({ ...withoutSrc(filter), reason: 'strength' })}`;
+  const dropCooldownQ = `${MET.dropped}${labels({ ...withoutSrc(filter), reason: 'cooldown' })}`;
 
   const [det, fin, ds, dc] = await Promise.all([
     promQuery(detQ).catch(() => []),
@@ -170,48 +174,61 @@ async function getDynGate(redis, sym) {
 }
 
 async function xadd(redis, key, fields, maxlen = 5000) {
-  const arr = [];
+  // node-redis v4 需要一个 {field: value} 对象
+  const msg = {};
   for (const [k, v] of Object.entries(fields)) {
-    arr.push(k, String(v));
+    msg[k] = String(v);
   }
-  await redis.xAdd(key, '*', arr, {
+  await redis.xAdd(key, '*', msg, {
     TRIM: { strategy: 'MAXLEN', strategyModifier: '~', threshold: maxlen },
   });
 }
 
 /** ---- 基础注入：1条会通过，1条 strength drop，1条 cooldown drop ---- */
-async function injectSmoke(redis, { sym, dir, src, effMin0, cooldownMs }) {
-  const now = Date.now();
-  const key = buildDetectedKey(sym);
 
-  // 1) 会通过：强度足够，间隔足够
+async function injectSmoke(redis, { sym, dir, src, effMin0, cooldownMs }) {
+  const key = buildDetectedKey(sym);
+  const base = Date.now() - 1200; // 确保“#1 与 now 差距不大”，避免跨太久导致误差
+  const passTs = base; // #1: 通过
+  const strengthDropTs = base + 200; // #2: 稍后一点（强度低，被 strength 拦）
+  const cooldownDropTs = base + 400; // #3: 更后一点（强度够，但在冷却内，被 cooldown 拦）
+
+  // #1 会通过（强度高于门槛；相对“上一次 final”的 lastEmitTs，通常也会满足 dt>cool）
   await xadd(redis, key, {
-    ts: String(now - cooldownMs - 1000),
+    ts: String(passTs),
     instId: sym,
     dir,
-    strength: String(Math.max(effMin0 + 0.1, 0.8)),
+    strength: String(Math.max(effMin0 + 0.08, 0.82)),
     'evidence.src': src,
     'evidence.notional3s': '5000000',
+    // 在三条的 fields 里都加上
+    kind: 'intra',
+    strategyId: 'manual',
   });
 
-  // 2) strength drop：低于门槛
+  // #2 会被 strength drop
   await xadd(redis, key, {
-    ts: String(now - 500),
+    ts: String(strengthDropTs),
     instId: sym,
     dir,
     strength: String(Math.max(0.1, effMin0 - 0.1)),
     'evidence.src': src,
-    'evidence.notional3s': '10000',
+    'evidence.notional3s': '10000', // 在三条的 fields 里都加上
+    kind: 'intra',
+    strategyId: 'manual',
   });
 
-  // 3) cooldown drop：与 #1 同方向 & 在冷却内
+  // #3 会被 cooldown drop（因为 passTs 和 cooldownDropTs 相差只有 ~400ms，远小于 cooldownMs）
   await xadd(redis, key, {
-    ts: String(now - 200),
+    ts: String(cooldownDropTs),
     instId: sym,
     dir,
-    strength: String(Math.max(effMin0 + 0.05, 0.75)),
+    strength: String(Math.max(effMin0 + 0.05, 0.78)),
     'evidence.src': src,
     'evidence.notional3s': '4000000',
+    // 在三条的 fields 里都加上
+    kind: 'intra',
+    strategyId: 'manual',
   });
 }
 

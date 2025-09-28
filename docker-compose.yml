@@ -22,6 +22,7 @@ services:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
       - GF_USERS_DEFAULT_THEME=dark
+
     volumes:
       # 1) provisioning 目录（数据源/仪表盘 provider）
       - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro

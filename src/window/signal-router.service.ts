@@ -123,7 +123,7 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
 
             // 全局开关
             if (!this.ENABLED) {
-              this.metrics.incDrop(sym, dir, 'disabled');
+              this.metrics.incDrop(sym, dir, 'disabled', src || 'unknown');
               this.safeAck(ackMap, m.key, m.id);
               continue;
             }
@@ -138,7 +138,7 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
 
             // 强度闸门
             if (!Number.isFinite(strength) || strength < finalMin) {
-              this.metrics.incDrop(sym, dir, 'strength');
+              this.metrics.incDrop(sym, dir, 'strength', src);
               this.logger.debug(
                 `[drop.strength] ${sym} ${dir} st=${Number.isFinite(strength) ? strength.toFixed(3) : 'NaN'} < min=${finalMin.toFixed(
                   2,
@@ -153,7 +153,7 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
             const lastTs = this.lastEmitTs.get(stateKey) || 0;
             const cool = (cooldownMs || 0) + this.EXTRA_COOLDOWN_MS;
             if (ts - lastTs < cool) {
-              this.metrics.incDrop(sym, dir, 'cooldown');
+              this.metrics.incDrop(sym, dir, 'cooldown', src);
               this.logger.debug(
                 `[drop.cooldown] ${sym} ${dir} dt=${ts - lastTs} < cool=${cool} src=${src}`,
               );
@@ -169,7 +169,7 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
               lastKey === approxKey &&
               ts - lastTs < cool
             ) {
-              this.metrics.incDrop(sym, dir, 'dedup');
+              this.metrics.incDrop(sym, dir, 'dedup', src);
               this.logger.debug(
                 `[drop.dedup] ${sym} ${dir} approx_key=${approxKey}`,
               );
@@ -217,7 +217,7 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
               src,
             });
 
-                   this.logger.log(
+            this.logger.log(
               `[signal.final] inst=${sym} dir=${dir} st=${strength.toFixed(3)} src=${src} cool=${cool}`,
             );
 

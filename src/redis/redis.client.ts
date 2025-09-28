@@ -20,7 +20,7 @@ export class RedisClient {
 
   constructor(opts: RedisClientOptions = {}) {
     const {
-      url = process.env.REDIS_URL || 'redis://127.0.0.1:6379',
+      url = process.env.REDIS_URL || 'redis://127.0.0.1:6379/0',
       keyPrefix = '',
       defaultTTL,
       enableAutoPipelining = true,
