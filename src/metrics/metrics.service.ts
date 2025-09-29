@@ -13,6 +13,13 @@ import {
 export class MetricsService {
   private readonly registry = new Registry();
 
+  // ---- Histograms ----
+  private readonly routerLatency: Histogram<string>;
+  private readonly routerPublishMs: Histogram<string>;
+
+  // ✅ 新增：
+  private readonly routerPriceLag: Histogram<string>;
+
   // ---- Counters ----
   private readonly detectedTotal: Counter<string>;
   private readonly finalTotal: Counter<string>;
@@ -27,16 +34,19 @@ export class MetricsService {
   private readonly dyngateOiRegime: Gauge<string>;
   private readonly dyngateBreakoutBandPct: Gauge<string>;
 
-  // ---- Histograms ----
-  private readonly routerLatency: Histogram<string>;
-  private readonly routerPublishMs: Histogram<string>;
-
   // 在类字段里新增
   private readonly evalTotal: Counter<string>;
   private readonly evalWin: Counter<string>;
   private readonly evalLoss: Counter<string>;
   private readonly evalRetBp: Histogram<string>;
   private readonly evalOpenJobs: Gauge<string>;
+
+  private readonly routerPriceStaleTotal = new Counter({
+    name: 'quant_router_price_stale_total',
+    help: 'Count of stale refPx at routing time',
+    labelNames: ['sym', 'dir', 'src'] as const,
+    registers: [this.registry],
+  });
 
   constructor() {
     // 采集 Node 默认指标，统一前缀 quant_
@@ -171,6 +181,18 @@ export class MetricsService {
       labelNames: [] as const,
       registers: [this.registry],
     });
+
+    // ✅ 新增：
+    this.routerPriceLag = new Histogram({
+      name: 'quant_router_price_lag_ms',
+      help: 'Price lag between signal ts and refPx ts (ms)',
+      labelNames: ['sym', 'dir', 'src'] as const,
+      // 典型分布分桶（毫秒），可按你线上分位再调
+      buckets: [
+        50, 100, 150, 200, 300, 500, 800, 1200, 2000, 3000, 5000, 8000, 12000,
+      ],
+      registers: [this.registry],
+    });
   }
 
   // 给 /metrics 控制器用
@@ -199,6 +221,16 @@ export class MetricsService {
     if (Number.isFinite(effMin0)) this.dyngateEffMin0.labels(sym).set(effMin0);
     if (Number.isFinite(cooldownMs))
       this.dyngateCooldownMs.labels(sym).set(cooldownMs);
+  }
+
+  // ✅ 新增：
+  observePriceLag(sym: string, lagMs: number, dir = 'na', src = 'na') {
+    if (!Number.isFinite(lagMs) || lagMs < 0 || lagMs > 24 * 3600_000) return;
+    this.routerPriceLag.labels(sym, dir, src).observe(lagMs);
+  }
+
+  incPriceStale(sym: string, dir: string, src: string) {
+    this.routerPriceStaleTotal.labels(sym, dir || 'na', src || 'na').inc();
   }
 
   /** 设置动态门槛（扩展版，一次性把快照相关指标都打点） */

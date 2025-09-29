@@ -8,6 +8,7 @@ import {
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { MetricsService } from 'src/metrics/metrics.service';
 import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
+import { RedisClient } from 'src/redis/redis.client';
 import { parseSymbolsFromEnv } from 'src/utils/utils';
 
 type DetectedRow = Record<string, string>;
@@ -19,6 +20,23 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
 
   private readonly symbols = parseSymbolsFromEnv();
 
+  // ==== P0 配置（可走 .env）====
+  private readonly MIN_SPACING_MS = Number(
+    process.env.SIGNAL_MIN_SPACING_MS ?? '10000',
+  ); // 10s
+  private readonly HYST_HI = Number(process.env.SIGNAL_HYST_HI ?? '0.75'); // 切换方向所需更高阈值
+  private readonly HYST_LO = Number(process.env.SIGNAL_HYST_LO ?? '0.55'); // 同向维持较低阈值
+
+  // 幂等锁配置
+  private readonly IDEM_BUCKET_MS = Number(
+    process.env.SIGNAL_IDEM_BUCKET_MS ?? '8000',
+  ); // 指纹时间桶
+  private readonly IDEM_TTL_MS = Number(
+    process.env.SIGNAL_IDEM_TTL_MS ?? '10000',
+  ); // 锁 TTL（略大于 bucket）
+
+  // 最近一次“最终发车”的方向（按标的）
+  private lastEmitDir = new Map<string, 'buy' | 'sell'>(); // key = sym
   // 运行态：按 sym|dir 做冷却/去重（最终层面的）
   private lastEmitTs = new Map<string, number>(); // key=sym|dir
   private lastEmitKey = new Map<string, string>(); // key=sym|dir -> evidence.approx_key
@@ -43,6 +61,7 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
     private readonly redis: RedisStreamsService,
     private readonly bus: EventEmitter2,
     private readonly metrics: MetricsService,
+    private readonly redisClient: RedisClient, // ✅ 新增注入：幂等锁
   ) {}
 
   async onModuleInit() {
@@ -177,7 +196,66 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
               continue;
             }
 
-            // 通过 -> 发布到 final 流
+            // ===== P0-2: min-spacing（同标的+同方向的最小间隔） =====
+            const spacingKey = `${sym}|${dir}`;
+            const sinceLast = Date.now() - lastTs;
+            if (sinceLast < this.MIN_SPACING_MS) {
+              this.logger.debug(
+                `[drop.min_spacing] ${sym} ${dir} sinceLast=${sinceLast}ms < ${this.MIN_SPACING_MS}ms`,
+              );
+              this.metrics?.incDrop?.(sym, dir, 'min_spacing', src);
+              this.safeAck(ackMap, m.key, m.id);
+              continue;
+            }
+
+            // ===== P0-3: hysteresis（方向切换更高阈值，同向较低阈值） =====
+            const lastDir = this.lastEmitDir.get(sym);
+            const needHi = lastDir && lastDir !== dir; // 切换方向
+            const passHysteresis = needHi
+              ? strength >= this.HYST_HI
+              : strength >= this.HYST_LO;
+            if (!passHysteresis) {
+              this.logger.debug(
+                `[drop.hysteresis] ${sym} lastDir=${lastDir ?? 'NA'} -> ${dir}, strength=${strength} ` +
+                  `(need ${needHi ? '>=HYST_HI' : '>=HYST_LO'})`,
+              );
+              this.metrics?.incDrop?.(sym, dir, 'hysteresis', src);
+              this.safeAck(ackMap, m.key, m.id);
+              continue;
+            }
+
+            // ===== P0-4: 幂等锁（指纹锁，防止重连/重试/同一动机重复发车） =====
+            const idemKey = this.buildIdemKey(sym, dir, src, ts);
+            const token = await this.redisClient.tryLock(
+              idemKey,
+              this.IDEM_TTL_MS,
+            );
+            if (!token) {
+              this.logger.debug(
+                `[drop.idempotent_lock] ${sym} ${dir} src=${src} key=${idemKey}`,
+              );
+              this.metrics?.incDrop?.(sym, dir, 'idempotent_lock', src);
+              this.safeAck(ackMap, m.key, m.id);
+              continue;
+            }
+            // 注：一次性锁，无需 unlock，TTL 到期自动释放
+
+            // ===== P0-1：写入前计算 refPx_*（以 refPx_ts 为锚） =====
+            const { refPx, refPx_source, refPx_ts, refPx_stale } =
+              await this.getRefPx(sym);
+
+            // price lag 观测（可选，不存在方法也不会报错）
+            if (refPx_ts && Number.isFinite(ts)) {
+              const lag = Number(refPx_ts) - ts;
+              if (lag >= 0 && lag < 24 * 3600_000) {
+                this.metrics?.observePriceLag?.(sym, lag, dir, src);
+                this.logger.debug(
+                  `[router.price_lag] ${sym} ${dir} lag_ms=${lag} refSrc=${refPx_source}`,
+                );
+              }
+            }
+
+            // ===== 发布到 final 流 =====
             const outKey = this.redis.buildOutKey(sym, 'signal:final');
             await this.redis.xadd(
               outKey,
@@ -186,7 +264,14 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
                 instId: sym,
                 dir,
                 strength: String(strength),
-                // 透传关键信息，便于回放
+
+                // 参考价（P0-1）
+                ...(refPx ? { refPx } : {}),
+                ...(refPx_source ? { refPx_source } : {}),
+                ...(refPx_ts ? { refPx_ts } : {}),
+                ...(refPx_stale ? { refPx_stale } : {}),
+
+                // 透传证据...
                 'evidence.src': src,
                 'evidence.notional3s': h['evidence.notional3s'] ?? '',
                 'evidence.delta3s': h['evidence.delta3s'] ?? '',
@@ -201,12 +286,12 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
               { maxlenApprox: 5_000 },
             );
 
-            // 计数：final 成功
             this.metrics.incFinal(sym, dir, src);
 
-            // 状态记账
-            this.lastEmitTs.set(stateKey, ts);
-            if (approxKey) this.lastEmitKey.set(stateKey, approxKey);
+            // 记录发车状态（供下一次门控使用）
+            this.lastEmitTs.set(spacingKey, Date.now());
+            this.lastEmitDir.set(sym, dir);
+            if (approxKey) this.lastEmitKey.set(stateKey, approxKey); // ✅ 发车后回写 approxKey
 
             // 事件广播（进程内）
             this.bus.emit('signal.final', {
@@ -218,7 +303,10 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
             });
 
             this.logger.log(
-              `[signal.final] inst=${sym} dir=${dir} st=${strength.toFixed(3)} src=${src} cool=${cool}`,
+              `[signal.final] inst=${sym} dir=${dir} st=${strength.toFixed(3)} src=${src} cool=${cool}` +
+                (refPx
+                  ? ` refPx=${refPx} src=${refPx_source} lag=${refPx_ts ? Number(refPx_ts) - ts : 'NA'}`
+                  : ''),
             );
 
             // ACK
@@ -263,5 +351,86 @@ export class SignalRouterService implements OnModuleInit, OnModuleDestroy {
     const cooldownMs = Number(h?.cooldownMs ?? '9000');
     this.dynCache.set(sym, { ts: now, effMin0, cooldownMs });
     return { effMin0, cooldownMs };
+  }
+
+  // 统一取参考价：优先 mid(盘口)，兜底 last(成交)
+  private async getRefPx(sym: string): Promise<{
+    refPx?: string;
+    refPx_source?: 'mid' | 'last';
+    refPx_ts?: string;
+    refPx_stale?: 'true' | 'false';
+  }> {
+    const now = Date.now();
+    // A) 从盘口 stream 取最近一条
+    try {
+      const bookKey = this.redis.buildKey(sym, 'book'); // ws:{sym}:book（已前缀）
+      const rows = await this.redis.xrevrangeLatest(bookKey, 1);
+      if (rows && rows.length) {
+        const [id, fields] = rows[0];
+        const obj: Record<string, string> = {};
+        for (let i = 0; i < fields.length; i += 2)
+          obj[fields[i]] = fields[i + 1];
+        const bid = Number(obj['bid1.px']);
+        const ask = Number(obj['ask1.px']);
+        const ts = Number(obj.ts) || now;
+        if (
+          Number.isFinite(bid) &&
+          Number.isFinite(ask) &&
+          bid > 0 &&
+          ask > 0
+        ) {
+          const mid = (bid + ask) / 2;
+          return {
+            refPx: String(mid),
+            refPx_source: 'mid',
+            refPx_ts: String(ts),
+            refPx_stale: ts > 0 && now - ts > 200 ? 'true' : 'false',
+          };
+        }
+      }
+    } catch {
+      /* empty */
+    }
+
+    // B) 兜底：从成交 stream 取最近一条
+    try {
+      const tradeKey = this.redis.buildKey(sym, 'trades'); // ws:{sym}:trades（已前缀）
+      const rows = await this.redis.xrevrangeLatest(tradeKey, 1);
+      if (rows && rows.length) {
+        const [id, fields] = rows[0];
+        const obj: Record<string, string> = {};
+        for (let i = 0; i < fields.length; i += 2)
+          obj[fields[i]] = fields[i + 1];
+        const px = Number(obj.px);
+        const ts = Number(obj.ts) || now;
+        if (Number.isFinite(px) && px > 0) {
+          return {
+            refPx: String(px),
+            refPx_source: 'last',
+            refPx_ts: String(ts),
+            refPx_stale: ts > 0 && now - ts > 200 ? 'true' : 'false',
+          };
+        }
+      }
+    } catch {
+      /* empty */
+    }
+
+    // C) 实在没有，就不写 refPx 字段（回测可跳过该样本/标注未知）
+    return {};
+  }
+
+  // 构建幂等指纹键：instId|dir|src|时间桶
+  private buildIdemKey(
+    sym: string,
+    dir: 'buy' | 'sell',
+    src?: string,
+    ts?: number,
+  ) {
+    const bucket =
+      Math.floor((ts ?? Date.now()) / this.IDEM_BUCKET_MS) *
+      this.IDEM_BUCKET_MS;
+    const s = src || 'na';
+    return `idem:final:${sym}:${dir}:${s}:${bucket}`;
   }
 }

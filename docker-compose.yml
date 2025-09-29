@@ -1,4 +1,20 @@
 services:
+  redis:
+    image: redis:7.0.12
+    container_name: redis
+    ports: ['6379:6379']
+    command: ['redis-server', '--appendonly', 'yes']
+    volumes:
+      - redis-data:/data
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.62.0
+    container_name: redis_exporter
+    command: ['--redis.addr=redis:6379']
+    ports: ['9121:9121']
+    depends_on:
+      - redis
+
   prometheus:
     image: prom/prometheus:v2.53.1
     container_name: prometheus
@@ -6,6 +22,7 @@ services:
     volumes:
       - ./ops/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./ops/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
@@ -13,6 +30,8 @@ services:
       - '--storage.tsdb.retention.time=15d'
     extra_hosts:
       - 'host.docker.internal:host-gateway'
+    depends_on:
+      - redis-exporter
 
   grafana:
     image: grafana/grafana:10.4.3
@@ -22,14 +41,14 @@ services:
       - GF_AUTH_ANONYMOUS_ENABLED=true
       - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
       - GF_USERS_DEFAULT_THEME=dark
-
     volumes:
-      # 1) provisioning 目录（数据源/仪表盘 provider）
       - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
-      # 2) 仪表盘 JSON 的实际存放目录（与 dashboard.yml 的 path 对应）
       - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
-      # 3) 可选：持久化 grafana 数据（若希望每次都重新导入，可移除并配合 down -v）
       - grafana-storage:/var/lib/grafana
+    depends_on:
+      - prometheus
 
 volumes:
+  redis-data:
+  prometheus-data:
   grafana-storage:
