@@ -5,6 +5,7 @@ import { RedisModule } from 'src/redis/redis.module';
 import { DynGateReaderModule } from 'src/dyn-gate-reader/dyn-gate-reader.module';
 import { SignalRouterService } from './signal-router.service';
 import { MetricsModule } from 'src/metrics/metrics.module';
+import { HistBackfillService } from './hist-backfill.service';
 
 @Module({
   imports: [
@@ -13,7 +14,7 @@ import { MetricsModule } from 'src/metrics/metrics.module';
     DynGateReaderModule,
     MetricsModule,
   ],
-  providers: [WindowWorkerService, SignalRouterService],
+  providers: [WindowWorkerService, HistBackfillService, SignalRouterService],
   exports: [SignalRouterService],
 })
 export class WindowModule {}
