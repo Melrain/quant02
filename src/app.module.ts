@@ -13,6 +13,7 @@ import { CronModule } from './cron/cron.module';
 import { DynGateReaderModule } from './dyn-gate-reader/dyn-gate-reader.module';
 import { ObservabilityModule } from './observability/obeservability.module';
 import { MetricsModule } from './metrics/metrics.module';
+import { SimTraderModule } from './sim-trader/sim-trader.module';
 
 @Module({
   imports: [
@@ -31,6 +32,7 @@ import { MetricsModule } from './metrics/metrics.module';
     DynGateReaderModule,
     ObservabilityModule,
     MetricsModule,
+    SimTraderModule,
   ],
   controllers: [AppController],
   providers: [AppService],
