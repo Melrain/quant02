@@ -13,7 +13,9 @@ import { CronModule } from './cron/cron.module';
 import { DynGateReaderModule } from './dyn-gate-reader/dyn-gate-reader.module';
 import { ObservabilityModule } from './observability/obeservability.module';
 import { MetricsModule } from './metrics/metrics.module';
-import { SimTraderModule } from './sim-trader/sim-trader.module';
+
+import { PriceResolverModule } from './price-resolver/price-resolver.module';
+import { SimulatorModule } from './simulator/simulator.module';
 
 @Module({
   imports: [
@@ -32,7 +34,8 @@ import { SimTraderModule } from './sim-trader/sim-trader.module';
     DynGateReaderModule,
     ObservabilityModule,
     MetricsModule,
-    SimTraderModule,
+    SimulatorModule,
+    PriceResolverModule,
   ],
   controllers: [AppController],
   providers: [AppService],

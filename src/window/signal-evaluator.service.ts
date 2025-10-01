@@ -1,4 +1,5 @@
-/* eslint-disable @typescript-eslint/no-unused-vars */
+// src/window/signal-evaluator.service.ts
+
 import {
   Injectable,
   Logger,
@@ -7,18 +8,24 @@ import {
 } from '@nestjs/common';
 import { Cron } from '@nestjs/schedule';
 import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
-import { parseSymbolsFromEnv } from 'src/utils/utils';
 import { MetricsService } from 'src/metrics/metrics.service';
+import { PriceResolverService } from 'src/price-resolver/price-resolver.service';
+import { parseSymbolsFromEnv } from 'src/utils/utils';
 
 type FinalRow = Record<string, string>;
+
 type Job = {
-  id: string; // job id
+  id: string; // msgId|hzName
+  finalId: string; // 原始 final 的 stream id（便于审计）
   sym: string;
   dir: 'buy' | 'sell';
   ts0: number; // signal ts
-  p0: number; // entry price
-  hzMs: number; // horizon ms
-  dueAt: number; // resolve time
+  p0: number; // entry px
+  p0_src?: string; // entry px source
+  hzMs: number; // horizon (ms)
+  hzName: string; // 5m/15m/1h/...
+  dueAt: number; // ceil(ts0 + hzMs) 到下一根1m
+  retry: number; // p1 获取重试次数
 };
 
 @Injectable()
@@ -27,22 +34,34 @@ export class SignalEvaluatorService implements OnModuleInit, OnModuleDestroy {
   private running = false;
   private readonly symbols = parseSymbolsFromEnv();
 
-  // 简单内存任务表：key = jobId
+  // 内存任务表：key=job.id
   private pending = new Map<string, Job>();
 
-  // 评估用的两个 horizon
-  private readonly horizons = [
-    { name: '3m', ms: 3 * 60_000 },
-    { name: '15m', ms: 15 * 60_000 },
-  ];
+  // ===== ENV 配置 =====
+  private readonly horizons = this.parseHorizons(
+    process.env.EVAL_HORIZONS ?? '5m,15m',
+  );
+  private readonly successBp = Number(process.env.EVAL_SUCCESS_BP ?? '5'); // 成功阈
+  private readonly neutralBandBp = Number(
+    process.env.EVAL_NEUTRAL_BAND_BP ?? '2',
+  ); // 中性带
+  private readonly feeBp = Number(process.env.EVAL_FEE_BP ?? '0'); // 手续费/滑点（bp）
+  private readonly maxRetry = Math.max(
+    0,
+    Number(process.env.EVAL_MAX_RETRY ?? '6'),
+  );
+  private readonly pxSearchMs = Math.max(
+    0,
+    Number(process.env.EVAL_PX_SEARCH_MS ?? '15000'),
+  );
 
   constructor(
     private readonly redis: RedisStreamsService,
     private readonly metrics: MetricsService,
+    private readonly pricing: PriceResolverService,
   ) {}
 
   async onModuleInit() {
-    // 为每个 symbol 的 final 流建组
     const keys = this.symbols.map((s) =>
       this.redis.buildOutKey(s, 'signal:final'),
     );
@@ -50,10 +69,13 @@ export class SignalEvaluatorService implements OnModuleInit, OnModuleDestroy {
 
     this.running = true;
     void this.loop();
+
     this.logger.log(
-      `SignalEvaluator started for ${this.symbols.join(', ')}, horizons=${this.horizons
+      `SignalEvaluator started for ${this.symbols.join(', ')} | horizons=${this.horizons
         .map((h) => h.name)
-        .join('/')}`,
+        .join(
+          '/',
+        )} | successBp=${this.successBp} | neutralBandBp=${this.neutralBandBp} | feeBp=${this.feeBp} | maxRetry=${this.maxRetry} | pxSearchMs=${this.pxSearchMs}`,
     );
   }
 
@@ -61,7 +83,7 @@ export class SignalEvaluatorService implements OnModuleInit, OnModuleDestroy {
     this.running = false;
   }
 
-  // 主循环：消费 signal:final 并创建评估任务
+  // ========= 主消费循环：读取 signal:final -> 生成评估任务 =========
   private async loop() {
     const consumer = `eval#${process.pid}`;
     while (this.running) {
@@ -97,31 +119,63 @@ export class SignalEvaluatorService implements OnModuleInit, OnModuleDestroy {
               continue;
             }
 
-            // 取进场价：优先 win:state:1m 的 last（更稳健）
-            const p0 = await this.getEntryPrice(sym, ts0);
+            // —— p0 选取策略：优先 final.refPx（若不过期），否则交给 PriceResolver —— //
+            const refPx = Number(h.refPx);
+            const refTs = Number(h.refPx_ts);
+            const refStaleFlag =
+              String(h.refPx_stale ?? 'false').toLowerCase() === 'true';
+            const staleByTs =
+              Number.isFinite(refTs) && this.pxSearchMs > 0
+                ? Math.abs(refTs - ts0) > this.pxSearchMs
+                : false;
+
+            let p0 = NaN;
+            let p0_src = '';
+
+            if (
+              Number.isFinite(refPx) &&
+              refPx > 0 &&
+              !refStaleFlag &&
+              !staleByTs
+            ) {
+              p0 = refPx;
+              p0_src = h.refPx_source || 'refPx';
+            } else {
+              const hit = await this.pricing.getPriceAt(ts0, sym);
+              if (hit && Number.isFinite(hit.px) && hit.px > 0) {
+                p0 = hit.px;
+                p0_src = hit.source ?? 'resolver';
+              }
+            }
+
             if (!Number.isFinite(p0) || p0 <= 0) {
-              this.logger.debug(`[eval.skip] ${sym} bad p0 for ts=${ts0}`);
+              this.logger.debug(
+                `[eval.skip] ${sym} missing entry px @ ts=${ts0} (refPx=${refPx}, refPx_ts=${refTs}, refStale=${refStaleFlag}, staleByTs=${staleByTs})`,
+              );
               this.safeAck(ackMap, m.key, m.id);
               continue;
             }
 
-            // 为每个 horizon 建两个任务
+            // 为每个 horizon 建任务；到期锚点用 ceil 到下一根 1m
             for (const hz of this.horizons) {
+              const dueAt = ceilToNextMinute(ts0 + hz.ms);
               const job: Job = {
                 id: `${m.id}|${hz.name}`,
+                finalId: m.id,
                 sym,
                 dir,
                 ts0,
                 p0,
+                p0_src,
                 hzMs: hz.ms,
-                dueAt: ts0 + hz.ms,
+                hzName: hz.name,
+                dueAt,
+                retry: 0,
               };
               this.pending.set(job.id, job);
             }
 
-            // 观测 open 任务数
             this.metrics.setEvalOpenJobs(this.pending.size);
-
             this.safeAck(ackMap, m.key, m.id);
           } catch (e) {
             this.logger.warn(
@@ -139,13 +193,12 @@ export class SignalEvaluatorService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  // 每秒检查一次是否有到期任务
+  // ========= 每秒解算到期任务：取 p1 -> 计算 -> 落审计 =========
   @Cron('*/1 * * * * *')
   async tickResolve() {
     if (!this.running) return;
     const now = Date.now();
 
-    // 快速扫描（任务量不大时足够；后续量大可换最小堆）
     const due: Job[] = [];
     for (const j of this.pending.values()) {
       if (j.dueAt <= now) due.push(j);
@@ -154,49 +207,104 @@ export class SignalEvaluatorService implements OnModuleInit, OnModuleDestroy {
 
     for (const j of due) {
       try {
-        // 取对价：用 win:1m 的 close（选取 >= dueAt 的下一根bar）
-        const p1 = await this.getPriceAtCloseOf(symMinuteCeil(j.dueAt), j.sym);
-        if (!Number.isFinite(p1) || p1 <= 0) {
-          // 价格还没出，等下一轮
+        // 用 PriceResolver 在 dueAt 附近找价
+        const hit = await this.pricing.getPriceAt(j.dueAt, j.sym);
+        const hasP1 = !!hit && Number.isFinite(hit.px) && hit.px > 0;
+
+        if (!hasP1) {
+          if (j.retry < this.maxRetry) {
+            j.retry++;
+            this.logger.debug(
+              `[eval.retry] ${j.sym} ${j.dir} hz=${j.hzName} retry=${j.retry}/${this.maxRetry}`,
+            );
+            continue; // 等下次 tick
+          }
+
+          // 超过最大重试：落 miss 样本（不计算收益）
+          await this.redis.xadd(
+            this.redis.buildOutKey(j.sym, 'eval:done'),
+            {
+              ts0: String(j.ts0),
+              dueAt: String(j.dueAt),
+              horizon: j.hzName,
+              dir: j.dir,
+              p0: String(j.p0),
+
+              usedPx: '',
+              usedPx_ts: '0',
+              usedPx_source: 'na',
+              priceLagMs: '0',
+
+              retRawBp: '',
+              retNetBp: '',
+              thresholdBp: String(this.successBp),
+              neutralBandBp: String(this.neutralBandBp),
+              neutral: 'false',
+              success: 'false',
+              miss_px: 'true',
+              finalId: j.finalId,
+              retry: String(j.retry),
+            },
+            { maxlenApprox: 5000 },
+          );
+
+          this.pending.delete(j.id);
+          this.metrics.setEvalOpenJobs(this.pending.size);
           continue;
         }
 
-        // 方向化收益（bp）
-        // buy:  (p1/p0 - 1) * 10_000
-        // sell: (p0/p1 - 1) * 10_000  等价  -(p1/p0 - 1)*10_000
-        const retBp =
+        // 有 p1：计算收益
+        const p1 = hit.px;
+        const p1ts = hit.ts ?? j.dueAt;
+        const priceLagMs = Math.max(0, p1ts - j.dueAt);
+
+        const rawBp =
           j.dir === 'buy' ? (p1 / j.p0 - 1) * 10_000 : (j.p0 / p1 - 1) * 10_000;
 
-        const hzName =
-          this.horizons.find((h) => h.ms === j.hzMs)?.name ?? `${j.hzMs}ms`;
+        // 扣手续费/滑点（bp）
+        const netBp = rawBp - this.feeBp;
 
-        // 指标上报
-        this.metrics.observeEvalReturn(j.sym, hzName, j.dir, retBp);
-        this.metrics.incEvalTotal(j.sym, hzName, j.dir);
-        if (retBp >= 0) this.metrics.incEvalWin(j.sym, hzName, j.dir);
-        else this.metrics.incEvalLoss(j.sym, hzName, j.dir);
+        const isNeutral = Math.abs(netBp) < this.neutralBandBp;
+        const isSuccess = !isNeutral && netBp >= this.successBp;
 
-        // 审计流
-        const key = this.redis.buildOutKey(j.sym, 'eval:done');
+        // 指标
+        this.metrics.observeEvalReturn(j.sym, j.hzName, j.dir, netBp);
+        this.metrics.incEvalTotal(j.sym, j.hzName, j.dir);
+        if (isSuccess) this.metrics.incEvalWin(j.sym, j.hzName, j.dir);
+        else this.metrics.incEvalLoss(j.sym, j.hzName, j.dir);
+
+        // 审计
         await this.redis.xadd(
-          key,
+          this.redis.buildOutKey(j.sym, 'eval:done'),
           {
             ts0: String(j.ts0),
             dueAt: String(j.dueAt),
-            horizon: hzName,
+            horizon: j.hzName,
             dir: j.dir,
             p0: String(j.p0),
-            p1: String(p1),
-            retBp: String(retBp.toFixed(2)),
+
+            usedPx: String(p1),
+            usedPx_ts: String(p1ts),
+            usedPx_source: String(hit.source ?? 'na'),
+            priceLagMs: String(priceLagMs),
+
+            retRawBp: rawBp.toFixed(4),
+            retNetBp: netBp.toFixed(4),
+            thresholdBp: String(this.successBp),
+            neutralBandBp: String(this.neutralBandBp),
+            neutral: String(isNeutral),
+            success: String(isSuccess),
+            miss_px: 'false',
+            finalId: j.finalId,
+            retry: String(j.retry),
           },
           { maxlenApprox: 5000 },
         );
 
-        // 移除任务
         this.pending.delete(j.id);
       } catch (e) {
         this.logger.warn(
-          `[eval.resolve] ${j.sym} ${j.dir} hz=${j.hzMs} failed: ${(e as Error).message}`,
+          `[eval.resolve] ${j.sym} ${j.dir} hz=${j.hzName} failed: ${(e as Error).message}`,
         );
       }
     }
@@ -204,54 +312,37 @@ export class SignalEvaluatorService implements OnModuleInit, OnModuleDestroy {
     this.metrics.setEvalOpenJobs(this.pending.size);
   }
 
+  // ========= 工具 =========
   private safeAck(ackMap: Map<string, string[]>, key: string, id: string) {
     if (!ackMap.has(key)) ackMap.set(key, []);
     ackMap.get(key)!.push(id);
   }
 
-  /** 进场价：优先 win:state:1m 的 last；兜底用最近 win:1m close */
-  private async getEntryPrice(sym: string, ts0: number): Promise<number> {
-    const stKey = this.redis.buildOutKey(sym, 'win:state:1m');
-    const st = await this.redis.hgetall(stKey);
-    const last = Number(st?.last);
-    if (Number.isFinite(last) && last > 0) return last;
-
-    // 兜底：找 ts0 前后 2 分钟范围内最近的一根 1m close
-    const k1Key = this.redis.buildOutKey(sym, 'win:1m');
-    const rows = await this.redis.readWindowAsObjects(
-      k1Key,
-      ts0 - 2 * 60_000,
-      ts0 + 2 * 60_000,
-    );
-    const closes = rows
-      .map((r) => ({ ts: Number(r.ts), close: Number(r.close) }))
-      .filter((x) => Number.isFinite(x.ts) && Number.isFinite(x.close));
-    if (!closes.length) return NaN;
-    // 取最接近 ts0 的那根
-    closes.sort((a, b) => Math.abs(a.ts - ts0) - Math.abs(b.ts - ts0));
-    return closes[0].close;
-  }
-
-  /** 取 >= t 的下一根 1m bar 的 close */
-  private async getPriceAtCloseOf(t: number, sym: string): Promise<number> {
-    const key = this.redis.buildOutKey(sym, 'win:1m');
-    const rows = await this.redis.readWindowAsObjects(
-      key,
-      t - 60_000,
-      t + 4 * 60_000,
-    );
-    const bars = rows
-      .map((r) => ({ ts: Number(r.ts), close: Number(r.close) }))
-      .filter((x) => Number.isFinite(x.ts) && Number.isFinite(x.close))
-      .sort((a, b) => a.ts - b.ts);
-
-    for (const b of bars) {
-      if (b.ts >= t) return b.close;
+  private parseHorizons(env: string): Array<{ name: string; ms: number }> {
+    const out: Array<{ name: string; ms: number }> = [];
+    for (const raw of env
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)) {
+      let ms = NaN;
+      if (/^\d+ms$/i.test(raw)) ms = Number(raw.replace(/ms$/i, ''));
+      else if (/^\d+s$/i.test(raw)) ms = Number(raw.replace(/s$/i, '')) * 1000;
+      else if (/^\d+m$/i.test(raw))
+        ms = Number(raw.replace(/m$/i, '')) * 60_000;
+      else if (/^\d+h$/i.test(raw))
+        ms = Number(raw.replace(/h$/i, '')) * 3_600_000;
+      else if (/^\d+$/.test(raw)) ms = Number(raw); // 数字按 ms
+      if (Number.isFinite(ms) && ms > 0) out.push({ name: raw, ms });
     }
-    return NaN;
+    return out.length
+      ? out
+      : [
+          { name: '5m', ms: 300_000 },
+          { name: '15m', ms: 900_000 },
+        ];
   }
 }
 
-function symMinuteCeil(ms: number) {
+function ceilToNextMinute(ms: number) {
   return Math.floor((ms - 1) / 60_000) * 60_000 + 60_000;
 }

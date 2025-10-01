@@ -8,7 +8,7 @@ import {
 import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
 import { MetricsService } from 'src/metrics/metrics.service';
 import { parseSymbolsFromEnv } from 'src/utils/utils';
-import { PriceResolverService } from 'src/pricing/price-resolver.service';
+import { PriceResolverService } from 'src/price-resolver/price-resolver.service';
 
 type FinalRow = Record<string, string>;
 
