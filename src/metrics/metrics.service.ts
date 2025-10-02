@@ -33,13 +33,38 @@ export class MetricsService {
   private readonly dyngateLiqPct: Gauge<string>;
   private readonly dyngateOiRegime: Gauge<string>;
   private readonly dyngateBreakoutBandPct: Gauge<string>;
-
+  // ---- Sim gauges ----
+  // （首批保留）
+  private readonly simPosNotional: Gauge<string>; // signed notional
+  private readonly simPosAvgPx: Gauge<string>; // avg price of current pos
+  private readonly simUnrealized: Gauge<string>; // unrealized pnl
+  private readonly simEquity: Gauge<string>; // equity = realized_today + unrealized
+  private readonly simLastTs: Gauge<string>; // last processed timestamp (ms)
+  // （日度统计保留）
+  private readonly simDailyPnl: Gauge<string>;
+  private readonly simDailyTrades: Gauge<string>;
+  private readonly simDailyTurnover: Gauge<string>;
+  private readonly simDailyFees: Gauge<string>;
+  private readonly simDailyRealizedPnL: Gauge<string>; // alias to simDailyPnl? kept for backward compatibility if needed
   // 在类字段里新增
   private readonly evalTotal: Counter<string>;
   private readonly evalWin: Counter<string>;
   private readonly evalLoss: Counter<string>;
   private readonly evalRetBp: Histogram<string>;
   private readonly evalOpenJobs: Gauge<string>;
+
+  // 模拟sim
+  private readonly simTrades: Counter<string>;
+  private readonly simTurnover: Counter<string>;
+  private readonly simFees: Counter<string>;
+  private readonly simReverses: Counter<string>;
+
+  private readonly simRealizedPnlNet: Gauge<string>;
+  private readonly simRealizedPnlGross: Gauge<string>;
+
+  private readonly simPosSize: Gauge<string>;
+
+  // simDailyPnl 已提前声明
 
   private readonly routerPriceStaleTotal = new Counter({
     name: 'quant_router_price_stale_total',
@@ -193,6 +218,121 @@ export class MetricsService {
       ],
       registers: [this.registry],
     });
+
+    // sim 模拟
+    this.simTrades = new Counter({
+      name: 'quant_sim_trades_total',
+      help: 'Sim trade events',
+      labelNames: ['sym', 'side', 'reason'] as const,
+      registers: [this.registry],
+    });
+
+    this.simTurnover = new Counter({
+      name: 'quant_sim_turnover_total',
+      help: 'Sim total turnover (USDT)',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+
+    this.simFees = new Counter({
+      name: 'quant_sim_fees_total',
+      help: 'Sim total fees (USDT)',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+
+    this.simReverses = new Counter({
+      name: 'quant_sim_reverses_total',
+      help: 'Sim reverse count',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+
+    this.simRealizedPnlNet = new Gauge({
+      name: 'quant_sim_realized_pnl_net',
+      help: 'Sim realized PnL (net, USDT)',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+
+    this.simRealizedPnlGross = new Gauge({
+      name: 'quant_sim_realized_pnl_gross',
+      help: 'Sim realized PnL (gross, USDT)',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+
+    this.simPosSize = new Gauge({
+      name: 'quant_sim_position_size',
+      help: 'Current simulated position size (signed)',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+
+    this.simPosAvgPx = new Gauge({
+      name: 'quant_sim_position_avg_px',
+      help: 'Current simulated position average price',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+
+    this.simLastTs = new Gauge({
+      name: 'quant_sim_last_ts_ms',
+      help: 'Last processed timestamp (ms)',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+
+    this.simDailyPnl = new Gauge({
+      name: 'quant_sim_day_realized_pnl',
+      help: 'Daily realized PnL (USDT)',
+      labelNames: ['sym', 'day'] as const,
+      registers: [this.registry],
+    });
+    // 日度统计（已保留 daily_* 指标，不再重复定义）
+    this.simDailyTrades = new Gauge({
+      name: 'quant_sim_daily_trades',
+      help: 'Daily trades',
+      labelNames: ['sym', 'day'] as const,
+      registers: [this.registry],
+    });
+    this.simDailyTurnover = new Gauge({
+      name: 'quant_sim_daily_turnover',
+      help: 'Daily turnover (USDT)',
+      labelNames: ['sym', 'day'] as const,
+      registers: [this.registry],
+    });
+    this.simDailyFees = new Gauge({
+      name: 'quant_sim_daily_fees',
+      help: 'Daily fees (USDT)',
+      labelNames: ['sym', 'day'] as const,
+      registers: [this.registry],
+    });
+    this.simDailyRealizedPnL = new Gauge({
+      name: 'quant_sim_daily_realized_pnl',
+      help: 'Realized PnL of today (quote)',
+      labelNames: ['sym', 'day'] as const,
+      registers: [this.registry],
+    });
+    // 快照指标
+    this.simPosNotional = new Gauge({
+      name: 'quant_sim_pos_notional',
+      help: 'Signed notional of current position (quote). Long>0, Short<0',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+    this.simUnrealized = new Gauge({
+      name: 'quant_sim_unrealized_pnl',
+      help: 'Unrealized PnL of current position (quote)',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
+    this.simEquity = new Gauge({
+      name: 'quant_sim_equity',
+      help: 'Equity = realized_today + unrealized',
+      labelNames: ['sym'] as const,
+      registers: [this.registry],
+    });
   }
 
   // 给 /metrics 控制器用
@@ -298,5 +438,55 @@ export class MetricsService {
   }
   setEvalOpenJobs(n: number) {
     this.evalOpenJobs.set(n);
+  }
+
+  // —— 对外方法（sim-trade.service.ts 调用）——
+  simIncTrade(
+    sym: string,
+    side: 'buy' | 'sell',
+    reason: 'open' | 'add' | 'close' | 'reverse' | 'fee',
+  ) {
+    this.simTrades.labels(sym, side, reason).inc();
+  }
+  simAddTurnover(sym: string, notional: number) {
+    this.simTurnover.labels(sym).inc(Math.max(0, notional));
+  }
+  simAddFees(sym: string, fee: number) {
+    this.simFees.labels(sym).inc(Math.max(0, fee));
+    this.simIncTrade(sym, 'buy', 'fee'); // side 任意占位，或不打 trade 也行
+  }
+  simIncReverse(sym: string) {
+    this.simReverses.labels(sym).inc();
+  }
+  simSetRealized(sym: string, gross: number, net: number) {
+    this.simRealizedPnlGross.labels(sym).set(gross);
+    this.simRealizedPnlNet.labels(sym).set(net);
+  }
+  simSetPos(sym: string, size: number, avgPx: number) {
+    this.simPosSize.labels(sym).set(size);
+    if (Number.isFinite(avgPx)) this.simPosAvgPx.labels(sym).set(avgPx);
+  }
+  simSetLastTs(sym: string, tsMs: number) {
+    this.simLastTs.labels(sym).set(tsMs);
+  }
+  simSetDaily(
+    sym: string,
+    day: string,
+    pnl: number,
+    trades: number,
+    turnover: number,
+    fees: number,
+  ) {
+    this.simDailyPnl.labels(sym, day).set(pnl);
+    this.simDailyTrades.labels(sym, day).set(trades);
+    this.simDailyTurnover.labels(sym, day).set(turnover);
+    this.simDailyFees.labels(sym, day).set(fees);
+  }
+
+  simSetUnrealized(sym: string, v: number) {
+    if (Number.isFinite(v)) this.simUnrealized.labels(sym).set(v);
+  }
+  simSetEquity(sym: string, v: number) {
+    if (Number.isFinite(v)) this.simEquity.labels(sym).set(v);
   }
 }

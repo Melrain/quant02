@@ -5,6 +5,7 @@ import {
   OnModuleInit,
   OnModuleDestroy,
 } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { RedisStreamsService } from 'src/redis-streams/redis-streams.service';
 import { MetricsService } from 'src/metrics/metrics.service';
 import { parseSymbolsFromEnv } from 'src/utils/utils';
@@ -51,6 +52,15 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
     process.env.SIM_IDEM_TTL_SEC ?? '86400',
   );
 
+  // —— MTM 配置 ——
+  private readonly MTM_INTERVAL_MS = Number(
+    process.env.SIM_MTM_INTERVAL_MS ?? '5000',
+  );
+  private readonly MTM_WRITE_STREAM =
+    (process.env.SIM_MTM_WRITE_STREAM ?? 'false').toLowerCase() === 'true';
+
+  private lastMtmTick = 0;
+
   private readonly symbols = parseSymbolsFromEnv();
 
   constructor(
@@ -75,7 +85,7 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
     void this.loop();
 
     this.logger.log(
-      `SimTradeService started for ${this.symbols.join(', ')} | Q=${this.NOTIONAL_Q} FEE=${this.FEE_BP}bp`,
+      `SimTradeService started for ${this.symbols.join(', ')} | Q=${this.NOTIONAL_Q} FEE=${this.FEE_BP}bp | MTM=${this.MTM_INTERVAL_MS}ms stream=${this.MTM_WRITE_STREAM}`,
     );
   }
 
@@ -83,6 +93,7 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
     this.running = false;
   }
 
+  /* =================== 主循环：消费 signal:final 做撮合 =================== */
   private async loop() {
     const consumer = process.env.SIM_CONSUMER_ID || `sim#${process.pid}`;
     while (this.running) {
@@ -153,7 +164,7 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
             }
 
             if (!Number.isFinite(px) || px! <= 0) {
-              // 缺价：记录事件并跳过
+              // 缺价：记录事件并打 dropped 指标
               await this.writeEvent(sym, {
                 ts: String(ts),
                 type: 'miss_px',
@@ -165,6 +176,7 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
                 'sim.miss_px',
                 h['evidence.src'] ?? 'unknown',
               );
+              this.metrics?.simSetLastTs?.(sym, ts);
               this.safeAck(ackMap, m.key, m.id);
               continue;
             }
@@ -172,13 +184,13 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
             // 2) 读取当前仓位
             const pos = await this.readPos(sym);
 
-            // 3) 计算操作
+            // 3) 交易记账
             const Q = this.NOTIONAL_Q;
             const feeOneSide = (Q * this.FEE_BP) / 10000; // 单边费（开/加）
             let realized = 0;
 
             if (pos.dir === 'flat') {
-              // 直接开仓
+              // —— 直接开仓 —— //
               await this.appendTrade(sym, {
                 ts,
                 instId: sym,
@@ -197,8 +209,24 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
                 entryTs: ts,
                 lastSigId: m.id,
               });
+
+              // 指标
+              this.metrics.simIncTrade(sym, dir, 'open');
+              this.metrics.simAddTurnover(sym, Q);
+              this.metrics.simAddFees(sym, feeOneSide);
+              this.metrics.simSetPos(sym, dir === 'buy' ? +Q : -Q, px!);
+              this.metrics.simSetLastTs(sym, ts);
+
+              // 日度累计 + 日度指标
+              await this.bumpDaily(sym, ts, {
+                realizedPnL: 0 - feeOneSide,
+                turnover: Q,
+                fees: feeOneSide,
+                trades: 1,
+              });
+              await this.syncDailyMetrics(sym, ts);
             } else if (pos.dir === dir) {
-              // 同向加仓：加权均价
+              // —— 同向加仓 —— //
               const newNotional = pos.notional + Q;
               const newAvg = (pos.avgPx * pos.notional + px! * Q) / newNotional;
 
@@ -220,11 +248,32 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
                 entryTs: pos.entryTs, // 不变
                 lastSigId: m.id,
               });
+
+              // 指标
+              this.metrics.simIncTrade(sym, dir, 'add');
+              this.metrics.simAddTurnover(sym, Q);
+              this.metrics.simAddFees(sym, feeOneSide);
+              this.metrics.simSetPos(
+                sym,
+                dir === 'buy' ? +newNotional : -newNotional,
+                newAvg,
+              );
+              this.metrics.simSetLastTs(sym, ts);
+
+              // 日度累计 + 日度指标
+              await this.bumpDaily(sym, ts, {
+                realizedPnL: 0 - feeOneSide,
+                turnover: Q,
+                fees: feeOneSide,
+                trades: 1,
+              });
+              await this.syncDailyMetrics(sym, ts);
             } else {
-              // 反向：先全平旧仓再开新仓
+              // —— 反向：先全平旧仓再开新仓 —— //
               realized = this.realizePnL(pos, px!, dir);
               const feeClose = (pos.notional * this.FEE_BP) / 10000;
               const feeOpen = feeOneSide;
+              const feesTotal = feeClose + feeOpen;
 
               await this.appendTrade(sym, {
                 ts,
@@ -232,7 +281,7 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
                 side: dir,
                 px: px!,
                 notional: Q,
-                fee: feeClose + feeOpen,
+                fee: feesTotal,
                 kind: 'reverse',
                 sigId: m.id,
                 priceSource: pxSrc ?? 'na',
@@ -247,26 +296,26 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
                 lastSigId: m.id,
               });
 
-              // 记到日度
+              // 指标
+              this.metrics.simIncReverse(sym);
+              this.metrics.simIncTrade(sym, dir, 'reverse');
+              this.metrics.simAddTurnover(sym, pos.notional + Q);
+              this.metrics.simAddFees(sym, feesTotal);
+              this.metrics.simSetPos(sym, dir === 'buy' ? +Q : -Q, px!);
+              this.metrics.simSetLastTs(sym, ts);
+
+              // 日度累计（净值=realized - feesTotal） + 日度指标
               await this.bumpDaily(sym, ts, {
-                realizedPnL: realized - (feeClose + feeOpen),
+                realizedPnL: realized - feesTotal,
                 turnover: pos.notional + Q,
-                fees: feeClose + feeOpen,
+                fees: feesTotal,
                 reverseCount: 1,
                 trades: 1,
               });
+              await this.syncDailyMetrics(sym, ts);
             }
 
-            // 日度累计（open/add 情况）
-            if (pos.dir === 'flat' || pos.dir === dir) {
-              await this.bumpDaily(sym, ts, {
-                realizedPnL: 0 - feeOneSide, // 开/加只计费
-                turnover: Q,
-                fees: feeOneSide,
-                trades: 1,
-              });
-            }
-
+            // 路由成功计数（按你的口径，可保留）
             this.metrics?.incFinal?.(sym, dir, h['evidence.src'] ?? 'sim');
 
             this.safeAck(ackMap, m.key, m.id);
@@ -286,12 +335,98 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /* =================== 定时 MTM：未实现盈亏 / 权益 =================== */
+
+  // 每秒 tick 一次，按 SIM_MTM_INTERVAL_MS 节流
+  @Cron('* * * * * *')
+  async tickMtm() {
+    if (!this.running) return;
+    const now = Date.now();
+    if (now - this.lastMtmTick < Math.max(1000, this.MTM_INTERVAL_MS)) return;
+    this.lastMtmTick = now;
+
+    for (const sym of this.symbols) {
+      try {
+        const pos = await this.readPos(sym);
+        if (
+          pos.dir === 'flat' ||
+          pos.notional <= 0 ||
+          !Number.isFinite(pos.avgPx)
+        ) {
+          // 清空/置零 MTM 快照
+          await this.writeMtm(sym, {
+            ts: now,
+            px: NaN,
+            unrealized: 0,
+            equity: await this.readTodayNet(sym, now), // 只有已实现
+            dir: 'flat',
+            avgPx: NaN,
+            notional: 0,
+          });
+          this.metrics?.simSetUnrealized?.(sym, 0);
+          this.metrics?.simSetEquity?.(sym, await this.readTodayNet(sym, now));
+          continue;
+        }
+
+        // 取最近价格（用同一 PriceResolver，传当前 now 即可）
+        const hit = await this.pricing.getPriceAt(now, sym);
+        if (!hit || !Number.isFinite(hit.px) || hit.px <= 0) {
+          // 拿不到价格就跳过这次（不覆盖上一次 mtm）
+          continue;
+        }
+
+        const px = hit.px;
+        const r =
+          pos.dir === 'buy'
+            ? (px - pos.avgPx) / pos.avgPx
+            : (pos.avgPx - px) / pos.avgPx;
+
+        const unrealized = pos.notional * r; // 以报价币计
+        const realizedToday = await this.readTodayNet(sym, now); // 已实现净额
+        const equity = realizedToday + unrealized;
+
+        // 写 MTM 快照 + 指标
+        await this.writeMtm(sym, {
+          ts: now,
+          px,
+          unrealized,
+          equity,
+          dir: pos.dir,
+          avgPx: pos.avgPx,
+          notional: pos.notional,
+          pxSource: hit.source,
+        });
+        this.metrics?.simSetUnrealized?.(sym, unrealized);
+        this.metrics?.simSetEquity?.(sym, equity);
+
+        if (this.MTM_WRITE_STREAM) {
+          await this.redis.xadd(
+            `sim:mtm:stream:{${sym}}`,
+            {
+              ts: String(now),
+              px: String(px),
+              unrealized: String(unrealized),
+              equity: String(equity),
+              dir: pos.dir,
+              avgPx: String(pos.avgPx),
+              notional: String(pos.notional),
+              priceSource: hit.source ?? 'na',
+            },
+            { maxlenApprox: 5000 },
+          );
+        }
+      } catch (e) {
+        this.logger.debug(`[mtm] ${sym} failed: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  /* =================== 小工具 / 持久化 =================== */
+
   private safeAck(ackMap: Map<string, string[]>, key: string, id: string) {
     if (!ackMap.has(key)) ackMap.set(key, []);
     ackMap.get(key)!.push(id);
   }
-
-  /* ----------------------- 持久化 / 读写 ----------------------- */
 
   private async readPos(sym: string): Promise<Pos> {
     const key = `sim:pos:{${sym}}`;
@@ -396,7 +531,57 @@ export class SimTradeService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /* ------------------------- 计算口径 ------------------------- */
+  /** 同步“当天”快照到 Prometheus（Gauge 语义） */
+  private async syncDailyMetrics(sym: string, ts: number) {
+    const day = yyyymmddUTC(ts);
+    const dayKey = `sim:daily:{${sym}}:${day}`;
+    const h = await this.redis.hgetall(dayKey);
+    const pnl = toNum(h?.realizedPnL) || 0;
+    const trades = toNum(h?.trades) || 0;
+    const turnover = toNum(h?.turnover) || 0;
+    const fees = toNum(h?.fees) || 0;
+
+    this.metrics.simSetDaily(sym, day, pnl, trades, turnover, fees);
+
+    // “已实现 PnL”也用 Gauge 暂存当日累计：方便在面板直接展示
+    this.metrics.simSetRealized(sym, pnl + fees /*gross*/, pnl /*net*/);
+  }
+
+  /** 写入/刷新 MTM 快照（hash） */
+  private async writeMtm(
+    sym: string,
+    row: {
+      ts: number;
+      px: number; // 标记价
+      unrealized: number; // 未实现盈亏（报价币）
+      equity: number; // 当日净值(已实现净额 + 未实现)
+      dir: 'buy' | 'sell' | 'flat';
+      avgPx: number;
+      notional: number;
+      pxSource?: string;
+    },
+  ) {
+    const key = `sim:mtm:{${sym}}`;
+    await this.redis.hset(key, {
+      ts: String(row.ts),
+      px: String(row.px),
+      unrealized: String(row.unrealized),
+      equity: String(row.equity),
+      dir: row.dir,
+      avgPx: String(row.avgPx),
+      notional: String(row.notional),
+      ...(row.pxSource ? { priceSource: row.pxSource } : {}),
+    });
+  }
+
+  /** 读取“当日已实现净额”（sim:daily 的 realizedPnL 字段） */
+  private async readTodayNet(sym: string, ts: number): Promise<number> {
+    const dayKey = `sim:daily:{${sym}}:${yyyymmddUTC(ts)}`;
+    const h = await this.redis.hgetall(dayKey);
+    return toNum(h?.realizedPnL) || 0;
+  }
+
+  /* =================== 计算口径 =================== */
 
   /** 平仓盈亏：按名义近似；多= (px-avg)/avg * notional；空= (avg-px)/avg * notional */
   private realizePnL(pos: Pos, px: number, newDir: 'buy' | 'sell'): number {
