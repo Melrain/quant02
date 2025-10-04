@@ -10,7 +10,7 @@
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "seed:params": "ts-node src/scripts/seed-effective-params.ts",
     "sim": "node scripts/sim_assert.mjs",
-    "start": "nest start",
+    "start": "npm run build && node dist/main.js",
     "start:dev": "nest start --watch",
     "start:debug": "nest start --debug --watch",
     "sim:smoke": "node scripts/sim.e2e.mjs --mode smoke",
