@@ -16,6 +16,7 @@ import { MetricsModule } from './metrics/metrics.module';
 
 import { PriceResolverModule } from './price-resolver/price-resolver.module';
 import { SimulatorModule } from './simulator/simulator.module';
+import { FiboModule } from './fibo/fibo.module';
 
 @Module({
   imports: [
@@ -36,6 +37,7 @@ import { SimulatorModule } from './simulator/simulator.module';
     MetricsModule,
     SimulatorModule,
     PriceResolverModule,
+    FiboModule,
   ],
   controllers: [AppController],
   providers: [AppService],
