@@ -49,9 +49,20 @@ export class SimTradeIntentService implements OnModuleInit, OnModuleDestroy {
 
   private readonly symbols = parseSymbolsFromEnv();
 
-  constructor(private readonly redis: RedisStreamsService) {}
+  constructor(private readonly redis: RedisStreamsService) {
+    this.logger.log(
+      `SimTradeIntentService constructed: symbols=${this.symbols.join(
+        ', ',
+      )} | NS=${this.NS} GROUP=${this.GROUP}`,
+    );
+  }
 
   async onModuleInit() {
+    this.logger.log(
+      `SimTradeIntentService init: symbols=${this.symbols.join(
+        ', ',
+      )} | NS=${this.NS} GROUP=${this.GROUP}`,
+    );
     if (!this.ENABLED) {
       this.logger.warn(
         'SimTradeIntentService disabled by SIM_INTENT_ENABLED=false',

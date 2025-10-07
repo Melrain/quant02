@@ -4,9 +4,10 @@ import { PriceResolverModule } from 'src/price-resolver/price-resolver.module';
 import { MetricsModule } from 'src/metrics/metrics.module';
 import { SimTradeIntentService } from './sim-trade-intent.service';
 import { FiboModule } from 'src/fibo/fibo.module';
+import { RedisStreamsModule } from 'src/redis-streams/redis-streams.module';
 
 @Module({
-  imports: [PriceResolverModule, MetricsModule, FiboModule],
+  imports: [PriceResolverModule, RedisStreamsModule, MetricsModule, FiboModule],
   controllers: [],
   providers: [SimTradeService, SimTradeIntentService],
   exports: [],
